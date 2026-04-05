@@ -1,4 +1,4 @@
-# AudioBookSlicer: Split `.m4b` by chapter
+# AudioBookSlicer: A collection of tools to create an MP3 audiobook file that includes proper chapter markers with associated cover images.
 
 This utility splits a DRM-free `.m4b`/`.m4a` audiobook into one file per chapter using chapter metadata.
 
