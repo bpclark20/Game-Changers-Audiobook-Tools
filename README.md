@@ -6,6 +6,62 @@ It uses:
 - `ffprobe` to read chapter start/end times
 - `ffmpeg` to extract each chapter with `-c copy` (no audio re-transcode) by default
 
+## AudioBook Slicer GUI
+
+A PyQt6 graphical interface for converting WAV files with Adobe Audition markers into chaptered MP3 files.
+
+### GUI Features
+
+- **Load WAV files** with chapter markers (Adobe Audition cue point format)
+- **Edit chapter titles** in-place (double-click any title to edit)
+- **Reorder chapters** via drag/drop in the chapter list
+- **Preview chapter artwork** by selecting chapters in the list
+- **Live encode progress** with per-chapter progress bars
+- **Adjust encoding options**: VBR quality, CBR bitrate, mono/stereo, or dual mono
+- **Size limit warnings**: Specify file size limit with unit selection (bytes, KB, MB, GB)
+- **Persistent settings**: Last-opened directory remembered between sessions
+- **Reset controls**: Reset all chapters to original markers or reset the entire app to defaults
+
+### Running the GUI
+
+The GUI requires PyQt6 to be installed in the project's virtual environment.
+
+**Activate the virtual environment and run:**
+
+```powershell
+& '.venv\Scripts\Activate.ps1'
+python gui.py
+```
+
+**Or use the venv Python directly:**
+
+```powershell
+& '.venv\Scripts\python.exe' gui.py
+```
+
+**Create a shortcut (optional):**
+
+Create `run_gui.ps1`:
+```powershell
+& '.venv\Scripts\Activate.ps1'
+python gui.py
+```
+
+Then double-click `run_gui.ps1` to launch.
+
+### GUI Workflow
+
+1. Click **Open WAV File** and select a WAV file with chapter markers
+2. Enter your **Book Title** (used for matching cover artwork files)
+3. Edit chapter titles by double-clicking them in the table
+4. (Optional) **Drag chapters** to reorder them—the output will be encoded in your custom order
+5. (Optional) Place cover images in the same folder as the WAV (e.g., `Book Title.jpg`, `Book Title.png`)
+6. Click **Process Covers** to associate artwork with chapters
+7. Choose encoding options (VBR/CBR, sample rate, mono/stereo)
+8. Set a **Size Limit** if desired (file size warning threshold)
+9. Click **Encode** and choose output location
+10. Watch live progress bars update as the MP3 is encoded with chapter boundaries
+
 ## Prerequisites
 
 1. Python 3.9+
