@@ -50,45 +50,49 @@ python .\split_m4b_chapters.py "book.m4b" --fallback-reencode --aac-bitrate 96k
 python .\split_m4b_chapters.py "book.m4b" --ffmpeg "C:\ffmpeg\bin\ffmpeg.exe" --ffprobe "C:\ffmpeg\bin\ffprobe.exe"
 ```
 
-## Convert Marker WAV To Chaptered M4B
+## Convert Marker WAV To Chaptered MP3
 
 If you have a single combined WAV with Adobe Audition markers (RIFF cue markers),
-you can encode it to M4B and carry chapters over:
+you can encode it to chaptered MP3 and carry chapters plus per-chapter artwork over.
+The script expects chapter titles in the format `Book Title - *` and matching
+cover images like `Book Title.jpg` or `Book Title.png` next to the WAV:
 
 ```powershell
-python .\wav_markers_to_m4b.py "C:\path\to\combined.wav"
+python .\wav_markers_to_mp3.py "C:\path\to\combined.wav"
 ```
 
 Default behavior:
-- Reads WAV cue markers/labels and creates M4B chapters
+- Reads WAV cue markers/labels and creates MP3 chapter tags
+- Requires matching cover images before encoding starts
 - Downmixes to mono (spoken-word friendly)
-- Encodes to AAC at `64k` bitrate
-- Writes `<input_stem>.m4b` next to input
-- Warns if final output is larger than `1.0 GB`
+- Encodes as VBR MP3 with `-q:a 6`
+- Preserves the input sample rate
+- Writes `<input_stem>.mp3` next to input
+- Warns if final output exceeds the effective 1.5% headroom budget, and again if it exceeds `1.0 GB`
 
-Size estimation options:
+Validation and inspection options:
 
 ```powershell
-# Print approximate output size, then continue converting
-python .\wav_markers_to_m4b.py "combined.wav" --estimate
+# Validate inputs and print VBR sizing notes, then continue converting
+python .\wav_markers_to_mp3.py "combined.wav" --estimate
 
-# Estimate only (no conversion)
-python .\wav_markers_to_m4b.py "combined.wav" --estimate-only
+# Validate inputs only (no conversion)
+python .\wav_markers_to_mp3.py "combined.wav" --estimate-only
 
-# Change bitrate and max-size warning threshold
-python .\wav_markers_to_m4b.py "combined.wav" --bitrate 80k --max-size-gb 1.0
+# Change VBR quality and max-size warning threshold
+python .\wav_markers_to_mp3.py "combined.wav" --vbr-quality 4 --max-size-gb 1.0
 
 # Print marker/chapter timing debug info before conversion
-python .\wav_markers_to_m4b.py "combined.wav" --debug-markers
+python .\wav_markers_to_mp3.py "combined.wav" --debug-markers
 
 # Preserve stereo instead of default mono downmix
-python .\wav_markers_to_m4b.py "combined.wav" --stereo
+python .\wav_markers_to_mp3.py "combined.wav" --stereo
 ```
 
 You can also pass explicit FFmpeg paths if needed:
 
 ```powershell
-python .\wav_markers_to_m4b.py "combined.wav" --ffmpeg "C:\ffmpeg\bin\ffmpeg.exe" --ffprobe "C:\ffmpeg\bin\ffprobe.exe"
+python .\wav_markers_to_mp3.py "combined.wav" --ffmpeg "C:\ffmpeg\bin\ffmpeg.exe" --ffprobe "C:\ffmpeg\bin\ffprobe.exe"
 ```
 
 ## Strip Chapter Number Prefix From WAV Files
