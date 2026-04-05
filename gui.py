@@ -427,6 +427,8 @@ class MainWindow(QMainWindow):
         self._encode_progress_timeline: list[Chapter] = []
         self._is_populating_table = False
         self._was_maximized = self.isMaximized()
+        self._remembered_conflict_path: Path | None = None
+        self._remembered_conflict_choice: str | None = None
         self._settings = QSettings("AudioBookSlicer", "AudioBookSlicer")
 
         # ── Central widget ────────────────────────────────────────────────────
@@ -684,21 +686,15 @@ class MainWindow(QMainWindow):
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self._table.setColumnWidth(4, THUMB_SIZE + 8)
 
-        # ── Bottom bar: action buttons ────────────────────────────────────────
-        bottom = QHBoxLayout()
-        bottom.addStretch()
-
         self._covers_btn = QPushButton("Process Covers")
         self._covers_btn.setEnabled(False)
         self._covers_btn.clicked.connect(self._on_process_covers)
-        bottom.addWidget(self._covers_btn)
 
         bottom_panel = QWidget()
         bottom_panel_layout = QVBoxLayout(bottom_panel)
         bottom_panel_layout.setContentsMargins(0, 0, 0, 0)
-        bottom_panel_layout.setSpacing(6)
+        bottom_panel_layout.setSpacing(0)
         bottom_panel_layout.addWidget(self._table)
-        bottom_panel_layout.addLayout(bottom)
 
         self._main_splitter = QSplitter(Qt.Orientation.Vertical)
         self._main_splitter.setChildrenCollapsible(False)
@@ -718,6 +714,7 @@ class MainWindow(QMainWindow):
         # ── Status bar ────────────────────────────────────────────────────────
         self._status = QStatusBar()
         self.setStatusBar(self._status)
+        self._status.addPermanentWidget(self._covers_btn)
         self._status.showMessage("Open a WAV file to begin.")
         self._on_encode_mode_changed()
 
@@ -760,7 +757,7 @@ class MainWindow(QMainWindow):
         self._book_title_edit.blockSignals(True)
         self._book_title_edit.clear()
         self._book_title_edit.blockSignals(False)
-        self._output_path_edit.clear()
+        self._set_output_path(None)
         self._duration_edit.clear()
 
         self._table.clearContents()
@@ -861,7 +858,15 @@ class MainWindow(QMainWindow):
         self._next_cover_action = "all"
         self._file_label.setText(str(wav_path))
         self._duration_edit.setText(_format_duration_label(duration_sec))
-        self._set_book_title(wav_path.stem, auto_unique_output=True)
+        self._set_book_title(wav_path.stem, auto_unique_output=False)
+        initial_output_path = self._output_path_for_current_title()
+        if initial_output_path is not None:
+            resolved_output_path = self._resolve_output_conflict(
+                initial_output_path,
+                cancel_returns_none=False,
+            )
+            if resolved_output_path is not None:
+                self._output_path_edit.setText(str(resolved_output_path))
         self._populate_table(chapters)
         self._update_cover_preview(None)
         self._covers_btn.setEnabled(True)
@@ -889,6 +894,74 @@ class MainWindow(QMainWindow):
         stem = _sanitize_output_stem(self._current_book_title())
         return self._output_dir / f"{stem}.mp3"
 
+    def _clear_output_conflict_memory(self) -> None:
+        self._remembered_conflict_path = None
+        self._remembered_conflict_choice = None
+
+    def _set_output_path(self, output_path: Path | None) -> None:
+        old_text = self._output_path_edit.text().strip()
+        new_text = str(output_path) if output_path is not None else ""
+        self._output_path_edit.setText(new_text)
+        if new_text != old_text:
+            self._clear_output_conflict_memory()
+
+    def _build_unique_output_path(self, output_path: Path) -> Path:
+        stem = output_path.stem
+        parent = output_path.parent
+        counter = 1
+        while True:
+            candidate = parent / f"{stem}({counter}).mp3"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    def _resolve_output_conflict(
+        self,
+        output_path: Path,
+        *,
+        cancel_returns_none: bool,
+        use_remembered_choice: bool = False,
+    ) -> Path | None:
+        if not output_path.exists():
+            return output_path
+
+        if (
+            use_remembered_choice
+            and self._remembered_conflict_path == output_path
+            and self._remembered_conflict_choice is not None
+        ):
+            if self._remembered_conflict_choice == "overwrite":
+                return output_path
+            if self._remembered_conflict_choice == "unique":
+                return self._build_unique_output_path(output_path)
+            if self._remembered_conflict_choice == "cancel":
+                return None if cancel_returns_none else output_path
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Overwrite Output")
+        msg_box.setText(f"The output file already exists:\n{output_path}\n\nWhat would you like to do?")
+        msg_box.setIcon(QMessageBox.Icon.Question)
+        overwrite_btn = msg_box.addButton("Overwrite", QMessageBox.ButtonRole.AcceptRole)
+        unique_btn = msg_box.addButton("Create Unique", QMessageBox.ButtonRole.ActionRole)
+        msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg_box.setDefaultButton(unique_btn)
+        msg_box.exec()
+        clicked = msg_box.clickedButton()
+
+        if clicked is overwrite_btn:
+            self._remembered_conflict_path = output_path
+            self._remembered_conflict_choice = "overwrite"
+            return output_path
+        if clicked is unique_btn:
+            self._remembered_conflict_path = output_path
+            self._remembered_conflict_choice = "unique"
+            return self._build_unique_output_path(output_path)
+        self._remembered_conflict_path = output_path
+        self._remembered_conflict_choice = "cancel"
+        if cancel_returns_none:
+            return None
+        return output_path
+
     def _sync_output_path(self, auto_unique: bool = False) -> None:
         output_path = self._output_path_for_current_title()
         if output_path is not None and auto_unique and output_path.exists():
@@ -901,7 +974,7 @@ class MainWindow(QMainWindow):
                     break
                 counter += 1
             output_path = candidate
-        self._output_path_edit.setText(str(output_path) if output_path else "")
+        self._set_output_path(output_path)
 
     def _on_book_title_changed(self, _text: str) -> None:
         self._sync_output_path()
@@ -1092,7 +1165,7 @@ class MainWindow(QMainWindow):
             selected_path = selected_path.with_suffix(".mp3")
         self._output_dir = selected_path.parent
         self._set_book_title(selected_path.stem, auto_unique_output=False)
-        self._output_path_edit.setText(str(selected_path))
+        self._set_output_path(selected_path)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self._open_btn.setEnabled(enabled)
@@ -1192,7 +1265,7 @@ class MainWindow(QMainWindow):
         output_path = Path(output_text)
         if output_path.suffix.lower() != ".mp3":
             output_path = output_path.with_suffix(".mp3")
-            self._output_path_edit.setText(str(output_path))
+            self._set_output_path(output_path)
 
         unpopulated_rows = self._get_unpopulated_artwork_rows()
         if unpopulated_rows:
@@ -1230,33 +1303,16 @@ class MainWindow(QMainWindow):
                 self._status.showMessage("Encode cancelled.")
                 return
 
-        if output_path.exists():
-            msg_box = QMessageBox(self)
-            msg_box.setWindowTitle("Overwrite Output")
-            msg_box.setText(f"The output file already exists:\n{output_path}\n\nWhat would you like to do?")
-            msg_box.setIcon(QMessageBox.Icon.Question)
-            overwrite_btn = msg_box.addButton("Overwrite", QMessageBox.ButtonRole.AcceptRole)
-            unique_btn = msg_box.addButton("Create Unique", QMessageBox.ButtonRole.ActionRole)
-            msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            msg_box.setDefaultButton(unique_btn)
-            msg_box.exec()
-            clicked = msg_box.clickedButton()
-            if clicked is overwrite_btn:
-                pass  # proceed with original path
-            elif clicked is unique_btn:
-                stem = output_path.stem
-                parent = output_path.parent
-                counter = 1
-                while True:
-                    candidate = parent / f"{stem}({counter}).mp3"
-                    if not candidate.exists():
-                        break
-                    counter += 1
-                output_path = candidate
-                self._output_path_edit.setText(str(output_path))
-            else:
-                self._status.showMessage("Encode cancelled.")
-                return
+        resolved_output_path = self._resolve_output_conflict(
+            output_path,
+            cancel_returns_none=True,
+            use_remembered_choice=True,
+        )
+        if resolved_output_path is None:
+            self._status.showMessage("Encode cancelled.")
+            return
+        output_path = resolved_output_path
+        self._set_output_path(output_path)
 
         channels = 2 if self._stereo_radio.isChecked() else 1
         vbr_quality = int(self._vbr_q_combo.currentData())
