@@ -1,855 +1,258 @@
 #!/usr/bin/env python3
-"""Jingle browser GUI with category filters and playback device selection."""
+"""GUI front-end for wav_markers_to_mp3.py — chapter list viewer."""
 
 from __future__ import annotations
 
-import json
-import sys
-import ctypes
-import hashlib
+import io
 import os
 import shutil
 import subprocess
-import wave
-from dataclasses import dataclass
+import sys
+import tempfile
+import time
+from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, cast
 
+# Ensure wav_markers_to_mp3 is importable from the same directory
+# In a PyInstaller frozen build, resource files live in sys._MEIPASS; fall back to script dir for dev.
+_HERE = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(__file__).parent  # type: ignore[attr-defined]
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
-def _ensure_qt_logging_rules() -> None:
-    """Suppress noisy Qt internal warnings from multimedia backend teardown."""
-    suppress_rules = [
-        "qt.core.qobject.connect.warning=false",
-        "qt.multimedia.ffmpeg.warning=false",
-    ]
-    current = os.environ.get("QT_LOGGING_RULES", "").strip()
-    existing = [part.strip() for part in current.split(";") if part.strip()]
-    merged = list(existing)
-    for rule in suppress_rules:
-        if rule not in merged:
-            merged.append(rule)
-    os.environ["QT_LOGGING_RULES"] = ";".join(merged)
-
-
-_ensure_qt_logging_rules()
-
-_HERE = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(__file__).resolve().parent  # type: ignore[attr-defined]
-
-
-def _apply_windows_taskbar_icon(window: QMainWindow) -> None:
-    if sys.platform != "win32":
-        return
-    icon_source = Path(sys.executable) if getattr(sys, "frozen", False) else (_HERE / "icon.ico")
-    if not icon_source.exists():
-        return
-    hwnd = int(window.winId())
-    shell32 = ctypes.windll.shell32
-    user32 = ctypes.windll.user32
-    large = ctypes.c_void_p()
-    small = ctypes.c_void_p()
-    extracted = shell32.ExtractIconExW(str(icon_source), 0, ctypes.byref(large), ctypes.byref(small), 1)
-    if extracted <= 0:
-        return
-    WM_SETICON = 0x0080
-    ICON_SMALL = 0
-    ICON_BIG = 1
-    GCLP_HICON = -14
-    GCLP_HICONSM = -34
-    if small.value:
-        user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small.value)
-        user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, small.value)
-    if large.value:
-        user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, large.value)
-        user32.SetClassLongPtrW(hwnd, GCLP_HICON, large.value)
-
-from PyQt6.QtCore import (
-    QEasingCurve,
-    QEvent,
-    QFileSystemWatcher,
-    QObject,
-    QPropertyAnimation,
-    QSettings,
-    QTimer,
-    Qt,
-    QStandardPaths,
-    QUrl,
-)
-from PyQt6.QtGui import QAction, QCursor, QIcon, QKeyEvent, QKeySequence, QMouseEvent, QPixmap
-from PyQt6.QtWidgets import (
-    QApplication,
-    QComboBox,
-    QDialog,
-    QDialogButtonBox,
-    QFileDialog,
-    QMenu,
-    QGridLayout,
-    QGraphicsOpacityEffect,
-    QHBoxLayout,
-    QLabel,
-    QInputDialog,
-    QKeySequenceEdit,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
-    QSlider,
-    QStatusBar,
-    QHeaderView,
-    QSizePolicy,
-    QScrollArea,
-    QTableWidget,
-    QTableWidgetItem,
-    QVBoxLayout,
-    QWidget,
+from wav_markers_to_mp3 import (  # noqa: E402
+    Chapter,
+    build_chapters,
+    encode_output,
+    ensure_executable,
+    format_bytes,
+    format_seconds_hms,
+    probe_audio_info,
+    read_riff_chunks,
+    resolve_cover_images,
 )
 
-_has_qt_multimedia = False
 try:
-    from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
+    from PyQt6.QtCore import QEvent, QModelIndex, QObject, QProcess, QSettings, QThread, QTimer, Qt, QUrl, pyqtSignal  # noqa: E402
+    from PyQt6.QtGui import QAction, QCloseEvent, QColor, QDropEvent, QIcon, QMouseEvent, QPainter, QPixmap, QResizeEvent  # noqa: E402
+    from PyQt6.QtWidgets import (  # noqa: E402
+        QAbstractItemView,
+        QApplication,
+        QButtonGroup,
+        QComboBox,
+        QDialog,
+        QDialogButtonBox,
+        QFileDialog,
+        QHBoxLayout,
+        QHeaderView,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QMessageBox,
+        QPushButton,
+        QRadioButton,
+        QProgressBar,
+        QSizePolicy,
+        QSplitter,
+        QSpinBox,
+        QStatusBar,
+        QStyledItemDelegate,
+        QStyle,
+        QStyleOptionViewItem,
+        QTableWidget,
+        QTableWidgetItem,
+        QVBoxLayout,
+        QWidget,
+    )
+except ModuleNotFoundError as e:
+    print(
+        "\n❌ Error: PyQt6 is not installed.\n"
+        "PyQt6 is installed in the project's virtual environment (.venv).\n"
+        "To run this GUI, use one of these methods:\n\n"
+        "  Method 1 (Recommended - Activate venv first):\n"
+        f"    & '.venv\\Scripts\\Activate.ps1'\n"
+        "    python gui.py\n\n"
+        "  Method 2 (Direct - Use venv Python):\n"
+        f"    & '.venv\\Scripts\\python.exe' gui.py\n\n"
+        "  Method 3 (Create a shortcut):\n"
+        "    Create 'run_gui.ps1' with the Method 1 commands,\n"
+        "    then run: .\\run_gui.ps1\n\n"
+        "  Method 4 (NOT RECOMMENDED - Install to system Python):\n"
+        "    pip install PyQt6\n"
+        "    python gui.py\n"
+        "    (This may cause version conflicts with other projects)\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+_has_qt_multimedia: bool = False
+try:
+    from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer  # noqa: E402
 
     _has_qt_multimedia = True
 except ModuleNotFoundError:
     pass
 
-AUDIO_EXTENSIONS = {
-    ".wav",
-    ".mp3",
-    ".ogg",
-    ".flac",
-    ".m4a",
-    ".aac",
-    ".wma",
-    ".aiff",
-    ".aif",
+THUMB_SIZE = 48  # cover thumbnail height/width in pixels
+CHAPTER_PROGRESS_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+CHAPTER_KEY_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+CHAPTER_PREVIEW_PROGRESS_ROLE = int(Qt.ItemDataRole.UserRole) + 3
+
+DEFAULT_USE_VBR = True
+DEFAULT_VBR_QUALITY = 5
+DEFAULT_CBR_BITRATE = 64
+DEFAULT_CHANNELS = 1
+DEFAULT_SIZE_LIMIT_TEXT = "1000000000"
+DEFAULT_SIZE_UNIT = "B"
+DEFAULT_PREVIEW_DEVICE = ""
+
+VBR_QUALITY_BITRATE_HINTS: dict[int, str] = {
+    0: "220-260 kbps",
+    1: "190-230 kbps",
+    2: "170-210 kbps",
+    3: "150-195 kbps",
+    4: "140-185 kbps",
+    5: "120-165 kbps",
+    6: "100-140 kbps",
+    7: "85-120 kbps",
+    8: "70-105 kbps",
+    9: "55-85 kbps",
 }
 
-DUPLICATE_FORMAT_PRIORITY = {
-    ".wav": 0,
-    ".flac": 1,
-    ".aiff": 2,
-    ".aif": 2,
-    ".m4a": 3,
-    ".aac": 4,
-    ".ogg": 5,
-    ".wma": 6,
-    ".mp3": 7,
-}
 
-ORG_NAME = "JingleAllTheDay"
-APP_NAME = "JingleAllTheDay"
-APP_VERSION = "1.1.0.041226"
-
-
-def _runtime_app_dir() -> Path:
-    """Return the folder where the running app is located.
-
-    In frozen builds this is the executable directory; in debug/dev this is the script directory.
-    """
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-DEFAULT_KEYBOARD_SHORTCUTS: dict[str, str] = {
-    "rename": "F2",
-    "delete": "Delete",
-    "skip_previous": "Left",
-    "skip_next": "Right",
-    "select_up": "Up",
-    "select_down": "Down",
-}
-
-MEDIA_PLAY_KEYS = tuple(
-    key
-    for key in (
-        getattr(Qt.Key, "Key_MediaPlay", None),
-        getattr(Qt.Key, "Key_AudioPlay", None),
-    )
-    if key is not None
-)
-MEDIA_PAUSE_KEYS = tuple(
-    key
-    for key in (
-        getattr(Qt.Key, "Key_MediaPause", None),
-        getattr(Qt.Key, "Key_AudioPause", None),
-    )
-    if key is not None
-)
-MEDIA_TOGGLE_PLAYBACK_KEYS = tuple(
-    key
-    for key in (
-        getattr(Qt.Key, "Key_MediaTogglePlayPause", None),
-        getattr(Qt.Key, "Key_AudioPlay", None),
-    )
-    if key is not None
-)
-MEDIA_NEXT_KEYS = tuple(
-    key
-    for key in (
-        getattr(Qt.Key, "Key_MediaNext", None),
-        getattr(Qt.Key, "Key_AudioForward", None),
-    )
-    if key is not None
-)
-MEDIA_PREVIOUS_KEYS = tuple(
-    key
-    for key in (
-        getattr(Qt.Key, "Key_MediaPrevious", None),
-        getattr(Qt.Key, "Key_AudioRewind", None),
-    )
-    if key is not None
-)
-
-
-def _normalize_tags(raw: str | list[str] | tuple[str, ...] | None) -> list[str]:
-    if raw is None:
-        return []
-
-    if isinstance(raw, str):
-        # Accept comma or semicolon separated tags.
-        pieces = raw.replace(";", ",").split(",")
-    else:
-        pieces = [str(item) for item in raw]
-
-    out: list[str] = []
-    seen: set[str] = set()
-    for piece in pieces:
-        tag = piece.strip()
-        if not tag:
-            continue
-        key = tag.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(tag)
-    return out
-
-
-def _tags_to_text(tags: list[str]) -> str:
-    return ", ".join(tags)
-
-
-def _merge_tags(existing: list[str], incoming: list[str]) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for tag in [*existing, *incoming]:
-        clean = tag.strip()
-        if not clean:
-            continue
-        key = clean.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(clean)
-    return out
-
-
-def _remove_tags(existing: list[str], incoming: list[str]) -> list[str]:
-    remove_keys = {tag.casefold() for tag in incoming}
-    if not remove_keys:
-        return list(existing)
-    return [tag for tag in existing if tag.casefold() not in remove_keys]
-
-
-def _coerce_volume_percent(value: Any, default: int = 100) -> int:
-    try:
-        percent = int(round(float(value)))
-    except (TypeError, ValueError):
-        percent = default
-    return max(0, min(100, percent))
-
-
-def _chip_palette_for_tag_seed(tag_seed: str) -> tuple[str, str, str]:
-    palettes = [
-        ("#3b2f6b", "#5a4a96", "#4a3a82"),
-        ("#204d4f", "#2f7073", "#296063"),
-        ("#5a3e2b", "#7f5a3d", "#6d4f36"),
-        ("#2f4f2f", "#4c7a4c", "#3f683f"),
-        ("#5c2f4f", "#844571", "#6f3d60"),
-        ("#2f3f6a", "#455d99", "#3a5185"),
-        ("#4f4a2a", "#7a7340", "#686234"),
-        ("#4a2f2f", "#734646", "#613b3b"),
-    ]
-    digest = hashlib.sha1(tag_seed.casefold().encode("utf-8")).digest()
-    idx = digest[0] % len(palettes)
-    return palettes[idx]
-
-
-def _format_size_label(total_bytes: int) -> str:
-    size = float(max(0, total_bytes))
-    units = ["B", "KB", "MB", "GB", "TB"]
-    unit_idx = 0
-    while size >= 1000.0 and unit_idx < len(units) - 1:
-        size /= 1000.0
-        unit_idx += 1
-
-    if unit_idx == 0:
-        return f"{int(size)}{units[unit_idx]}"
-    return f"{size:.2f}{units[unit_idx]}"
-
-
-def _format_duration_hms(total_seconds: float) -> str:
-    sec = max(0, int(round(total_seconds)))
-    hours, rem = divmod(sec, 3600)
-    minutes, seconds = divmod(rem, 60)
+def _format_duration_label(duration_sec: float) -> str:
+    total_seconds = max(0, int(duration_sec))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-_FFPROBE_PATH: str | None = None
-_FFPROBE_CHECKED = False
+def _chapter_key(chapter: Chapter) -> str:
+    return f"{chapter.start_ms}:{chapter.end_ms}"
 
 
-def _get_ffprobe_path() -> str | None:
-    global _FFPROBE_PATH, _FFPROBE_CHECKED
-    if _FFPROBE_CHECKED:
-        return _FFPROBE_PATH
-    _FFPROBE_CHECKED = True
-    _FFPROBE_PATH = shutil.which("ffprobe")
-    return _FFPROBE_PATH
+def _format_counter_label(elapsed_sec: float, duration_sec: float) -> str:
+    return f"{_format_duration_label(elapsed_sec)} / {_format_duration_label(duration_sec)}"
 
 
-def _probe_duration_seconds(path: Path) -> float:
-    suffix = path.suffix.lower()
-    if suffix in {".wav", ".wave"}:
-        try:
-            with wave.open(str(path), "rb") as w:
-                frames = w.getnframes()
-                rate = w.getframerate()
-                if rate > 0:
-                    return float(frames) / float(rate)
-        except (wave.Error, OSError):
-            pass
-
-    ffprobe = _get_ffprobe_path()
-    if not ffprobe:
-        return 0.0
-
-    cmd = [
-        ffprobe,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ]
-    try:
-        run_kwargs: dict[str, Any] = {
-            "capture_output": True,
-            "text": True,
-            "timeout": 2.0,
-            "check": False,
-        }
-        if hasattr(subprocess, "CREATE_NO_WINDOW"):
-            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        result = subprocess.run(cmd, **run_kwargs)
-        if result.returncode != 0:
-            return 0.0
-        value = (result.stdout or "").strip()
-        if not value:
-            return 0.0
-        return max(0.0, float(value))
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return 0.0
-
-
-@dataclass
-class JingleRecord:
-    path: Path
-    categories: list[str]
-    size_bytes: int = 0
-    duration_seconds: float = 0.0
-
-    @property
-    def name(self) -> str:
-        return self.path.stem
-
-    @property
-    def folder(self) -> str:
-        parent = self.path.parent.name
-        return parent if parent else str(self.path.parent)
-
-
-class LibraryStore:
-    def __init__(self, json_path: Path) -> None:
-        self._json_path = json_path
-        self._entries: dict[str, dict[str, Any]] = {}
-        self._load()
-
-    def _load(self) -> None:
-        if not self._json_path.exists():
-            self._entries = {}
-            return
-        try:
-            payload = json.loads(self._json_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            self._entries = {}
-            return
-
-        self._entries = self._entries_from_payload(payload)
-
-    @staticmethod
-    def _entries_from_payload(payload: object) -> dict[str, dict[str, Any]]:
-        raw_items = payload.get("items", {}) if isinstance(payload, dict) else {}
-        entries: dict[str, dict[str, Any]] = {}
-        if isinstance(raw_items, dict):
-            for path_key, info in raw_items.items():
-                if not isinstance(path_key, str) or not isinstance(info, dict):
-                    continue
-
-                # Backward-compatible read: old shape used single category/subcategory strings.
-                category_raw = info.get("categories")
-                if category_raw is None:
-                    category_raw = info.get("category", "")
-
-                subcategory_raw = info.get("subcategories")
-                if subcategory_raw is None:
-                    subcategory_raw = info.get("subcategory", "")
-
-                categories = _merge_tags(
-                    _normalize_tags(category_raw),
-                    _normalize_tags(subcategory_raw),
-                )
-
-                entry: dict[str, Any] = {
-                    "categories": categories,
-                }
-
-                size_raw = info.get("size_bytes")
-                duration_raw = info.get("duration_seconds")
-                mtime_raw = info.get("mtime_ns")
-                try:
-                    if size_raw is not None:
-                        entry["size_bytes"] = max(0, int(size_raw))
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    if duration_raw is not None:
-                        entry["duration_seconds"] = max(0.0, float(duration_raw))
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    if mtime_raw is not None:
-                        entry["mtime_ns"] = max(0, int(mtime_raw))
-                except (TypeError, ValueError):
-                    pass
-
-                entries[path_key] = entry
-        return entries
-
-    def save(self) -> None:
-        self._json_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 4, "items": self._entries}
-        self._json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-    def export_to(self, destination: Path) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 4, "items": self._entries}
-        destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-    def import_from(self, source: Path) -> None:
-        payload = json.loads(source.read_text(encoding="utf-8"))
-        self._entries = self._entries_from_payload(payload)
-
-    def get(self, path: Path) -> list[str]:
-        info = self._entries.get(str(path), {})
-        categories = _normalize_tags(info.get("categories", []))
-        return categories
-
-    def set(self, path: Path, categories: list[str]) -> None:
-        key = str(path)
-        entry = dict(self._entries.get(key, {}))
-        entry["categories"] = _normalize_tags(categories)
-        self._entries[key] = entry
-
-    def remove(self, path: Path) -> None:
-        self._entries.pop(str(path), None)
-
-    def rename(self, source: Path, destination: Path) -> None:
-        source_key = str(source)
-        destination_key = str(destination)
-        entry = dict(self._entries.get(source_key, {}))
-        if source_key in self._entries:
-            self._entries.pop(source_key, None)
-        if entry:
-            self._entries[destination_key] = entry
-
-    def get_media_cache(self, path: Path) -> tuple[int, float, int] | None:
-        info = self._entries.get(str(path), {})
-        try:
-            size_bytes = int(info.get("size_bytes"))
-            duration_seconds = float(info.get("duration_seconds"))
-            mtime_ns = int(info.get("mtime_ns"))
-        except (TypeError, ValueError):
-            return None
-
-        if size_bytes < 0 or duration_seconds < 0.0 or mtime_ns < 0:
-            return None
-        return size_bytes, duration_seconds, mtime_ns
-
-    def set_media_cache(self, path: Path, size_bytes: int, duration_seconds: float, mtime_ns: int) -> None:
-        key = str(path)
-        entry = dict(self._entries.get(key, {}))
-        entry["size_bytes"] = max(0, int(size_bytes))
-        entry["duration_seconds"] = max(0.0, float(duration_seconds))
-        entry["mtime_ns"] = max(0, int(mtime_ns))
-        self._entries[key] = entry
-
-    def iter_entries(self) -> Iterator[tuple[str, dict[str, Any]]]:
-        for path_key, info in self._entries.items():
-            if isinstance(path_key, str) and isinstance(info, dict):
-                yield path_key, info
-
-    def sync_with_files(self, files: list[Path]) -> None:
-        keep = {str(path) for path in files}
-        self._entries = {k: v for k, v in self._entries.items() if k in keep}
-        for path in files:
-            key = str(path)
-            if key not in self._entries:
-                self._entries[key] = {"categories": []}
-
-
-class OptionsDialog(QDialog):
-    def __init__(
+class ChapterProgressDelegate(QStyledItemDelegate):
+    def paint(
         self,
-        live_output_device: str,
-        preview_output_device: str,
-        live_volume_percent: int,
-        preview_volume_percent: int,
-        samples_dir: Path | None = None,
-        parent: QWidget | None = None,
+        painter: QPainter | None,
+        option: QStyleOptionViewItem,
+        index: QModelIndex,
     ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Options")
-        self.setMinimumWidth(560)
-
-        root = QVBoxLayout(self)
-
-        folder_row = QHBoxLayout()
-        folder_label = QLabel("Samples Folder")
-        folder_label.setFixedWidth(120)
-        folder_row.addWidget(folder_label)
-        self._folder_edit = QLineEdit(str(samples_dir) if samples_dir else "")
-        self._folder_edit.setReadOnly(True)
-        self._folder_edit.setPlaceholderText("No folder selected")
-        folder_row.addWidget(self._folder_edit)
-        folder_browse_btn = QPushButton("Browse")
-        folder_browse_btn.clicked.connect(self._on_browse_folder)
-        folder_row.addWidget(folder_browse_btn)
-        root.addLayout(folder_row)
-
-        live_row = QHBoxLayout()
-        live_label = QLabel("Live Device")
-        live_label.setFixedWidth(100)
-        live_row.addWidget(live_label)
-
-        self._live_device_combo = QComboBox()
-        self._live_device_combo.setMinimumWidth(340)
-        self._live_device_combo.setToolTip("Audio output used in Live mode.")
-        live_row.addWidget(self._live_device_combo)
-
-        root.addLayout(live_row)
-
-        preview_row = QHBoxLayout()
-        preview_label = QLabel("Preview Device")
-        preview_label.setFixedWidth(100)
-        preview_row.addWidget(preview_label)
-
-        self._preview_device_combo = QComboBox()
-        self._preview_device_combo.setMinimumWidth(340)
-        self._preview_device_combo.setToolTip("Audio output used in Preview mode.")
-        preview_row.addWidget(self._preview_device_combo)
-
-        root.addLayout(preview_row)
-
-        live_volume_row = QHBoxLayout()
-        live_volume_label = QLabel("Live Volume")
-        live_volume_label.setFixedWidth(100)
-        live_volume_row.addWidget(live_volume_label)
-
-        self._live_volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self._live_volume_slider.setRange(0, 100)
-        self._live_volume_slider.setPageStep(5)
-        self._live_volume_slider.setValue(_coerce_volume_percent(live_volume_percent))
-        self._live_volume_slider.setToolTip("Playback volume used in Live mode.")
-        live_volume_row.addWidget(self._live_volume_slider)
-
-        self._live_volume_value_label = QLabel()
-        self._live_volume_value_label.setFixedWidth(44)
-        live_volume_row.addWidget(self._live_volume_value_label)
-
-        root.addLayout(live_volume_row)
-
-        preview_volume_row = QHBoxLayout()
-        preview_volume_label = QLabel("Preview Volume")
-        preview_volume_label.setFixedWidth(100)
-        preview_volume_row.addWidget(preview_volume_label)
-
-        self._preview_volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self._preview_volume_slider.setRange(0, 100)
-        self._preview_volume_slider.setPageStep(5)
-        self._preview_volume_slider.setValue(_coerce_volume_percent(preview_volume_percent))
-        self._preview_volume_slider.setToolTip("Playback volume used in Preview mode.")
-        preview_volume_row.addWidget(self._preview_volume_slider)
-
-        self._preview_volume_value_label = QLabel()
-        self._preview_volume_value_label.setFixedWidth(44)
-        preview_volume_row.addWidget(self._preview_volume_value_label)
-
-        root.addLayout(preview_volume_row)
-
-        refresh_btn = QPushButton("Refresh Devices")
-        refresh_btn.clicked.connect(self._on_refresh_clicked)
-        refresh_row = QHBoxLayout()
-        refresh_row.addWidget(refresh_btn)
-        refresh_row.addStretch()
-
-        root.addLayout(refresh_row)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
-
-        self._populate_devices(live_output_device, preview_output_device)
-        self._live_volume_slider.valueChanged.connect(self._sync_volume_labels)
-        self._preview_volume_slider.valueChanged.connect(self._sync_volume_labels)
-        self._sync_volume_labels()
-
-    def _populate_devices(self, live_selected: str, preview_selected: str) -> None:
-        self._populate_device_combo(self._live_device_combo, live_selected)
-        self._populate_device_combo(self._preview_device_combo, preview_selected)
-
-    def _populate_device_combo(self, combo: QComboBox, selected_device: str) -> None:
-        combo.blockSignals(True)
-        combo.clear()
-
-        default_name = ""
-        if _has_qt_multimedia:
-            try:
-                default_name = QMediaDevices.defaultAudioOutput().description().strip()
-                seen: set[str] = set()
-                for device in QMediaDevices.audioOutputs():
-                    name = device.description().strip()
-                    if not name or name in seen:
-                        continue
-                    seen.add(name)
-                    combo.addItem(name, name)
-            except Exception:
-                pass
-
-        default_label = "System Default"
-        if default_name:
-            default_label = f"System Default ({default_name})"
-        combo.insertItem(0, default_label, "")
-
-        target = selected_device.strip()
-        if target:
-            idx = combo.findData(target)
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
-            else:
-                combo.addItem(f"{target} (Unavailable)", target)
-                combo.setCurrentIndex(combo.count() - 1)
-        else:
-            combo.setCurrentIndex(0)
-
-        combo.blockSignals(False)
-
-    def _on_refresh_clicked(self) -> None:
-        live_current = self._live_device_combo.currentData()
-        preview_current = self._preview_device_combo.currentData()
-        live_selected = str(live_current).strip() if live_current is not None else ""
-        preview_selected = str(preview_current).strip() if preview_current is not None else ""
-        self._populate_devices(live_selected, preview_selected)
-
-    def selected_devices(self) -> tuple[str, str]:
-        live = self._live_device_combo.currentData()
-        preview = self._preview_device_combo.currentData()
-        live_value = str(live).strip() if live is not None else ""
-        preview_value = str(preview).strip() if preview is not None else ""
-        return live_value, preview_value
-
-    def selected_volumes(self) -> tuple[int, int]:
-        return (
-            _coerce_volume_percent(self._live_volume_slider.value()),
-            _coerce_volume_percent(self._preview_volume_slider.value()),
-        )
-
-    def selected_folder(self) -> Path | None:
-        text = self._folder_edit.text().strip()
-        if not text:
-            return None
-        p = Path(text)
-        return p if p.exists() and p.is_dir() else None
-
-    def _on_browse_folder(self) -> None:
-        current = self._folder_edit.text().strip()
-        start = current if current else str(Path.home())
-        selected = QFileDialog.getExistingDirectory(self, "Choose Samples Folder", start)
-        if not selected:
+        if painter is None:
             return
-        path = Path(selected)
-        if path.exists() and path.is_dir():
-            self._folder_edit.setText(str(path))
+        preview_progress_data = index.data(CHAPTER_PREVIEW_PROGRESS_ROLE)
+        encode_progress_data = index.data(CHAPTER_PROGRESS_ROLE)
 
-    def _sync_volume_labels(self) -> None:
-        self._live_volume_value_label.setText(f"{self._live_volume_slider.value()}%")
-        self._preview_volume_value_label.setText(f"{self._preview_volume_slider.value()}%")
+        progress_data: int | float | None = None
+        fill_color = QColor(70, 140, 90, 140)
+        if isinstance(preview_progress_data, (int, float)) and preview_progress_data > 0:
+            progress_data = preview_progress_data
+            fill_color = QColor(60, 120, 200, 165)
+        elif isinstance(encode_progress_data, (int, float)) and encode_progress_data > 0:
+            progress_data = encode_progress_data
+
+        if not isinstance(progress_data, (int, float)) or progress_data <= 0:
+            super().paint(painter, option, index)
+            return
+
+        progress = max(0.0, min(1.0, float(progress_data)))
+        paint_option = QStyleOptionViewItem(option)
+        self.initStyleOption(paint_option, index)
+        text = paint_option.text
+        paint_option.text = ""
+
+        style = paint_option.widget.style() if paint_option.widget else QApplication.style()
+        if style is None:
+            super().paint(painter, option, index)
+            return
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, paint_option, painter, paint_option.widget)
+
+        content_rect = paint_option.rect.adjusted(2, 2, -2, -2)
+        if content_rect.width() > 0 and content_rect.height() > 0:
+            fill_width = max(1, int(content_rect.width() * progress))
+            fill_rect = content_rect.adjusted(0, 0, -(content_rect.width() - fill_width), 0)
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill_color)
+            painter.drawRect(fill_rect)
+            painter.restore()
+
+        painter.save()
+        text_rect = content_rect.adjusted(6, 0, -6, 0)
+        if paint_option.state & QStyle.StateFlag.State_Selected:
+            text_role = paint_option.palette.ColorRole.HighlightedText
+        else:
+            text_role = paint_option.palette.ColorRole.Text
+        painter.setPen(paint_option.palette.color(text_role))
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            text,
+        )
+        painter.restore()
 
 
-class DeselectableTableWidget(QTableWidget):
-    """Clears selection when clicking blank table whitespace."""
+class ReorderableTableWidget(QTableWidget):
+    rowMoveRequested = pyqtSignal(int, int)
+    previewSeekRequested = pyqtSignal(int, float)
 
-    def __init__(self, rows: int, columns: int) -> None:
-        super().__init__(rows, columns)
-        self._preserve_selection_callback: Callable[[], bool] | None = None
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._drag_row = -1
 
-    def set_preserve_selection_callback(self, callback: Callable[[], bool]) -> None:
-        self._preserve_selection_callback = callback
+    def mousePressEvent(self, e: QMouseEvent | None) -> None:
+        seek_row = -1
+        seek_fraction = 0.0
+        if e is not None and e.button() == Qt.MouseButton.LeftButton:
+            pt = e.position().toPoint()
+            self._drag_row = self.rowAt(pt.y())
+            col = self.columnAt(pt.x())
+            if self._drag_row >= 0 and col == 1:
+                _model = self.model()
+                if _model is None:
+                    super().mousePressEvent(e)
+                    return
+                idx = _model.index(self._drag_row, col)
+                rect = self.visualRect(idx)
+                if rect.width() > 0:
+                    seek_row = self._drag_row
+                    seek_fraction = (pt.x() - rect.left()) / rect.width()
+                    seek_fraction = max(0.0, min(1.0, float(seek_fraction)))
+        super().mousePressEvent(e)
+        if seek_row >= 0:
+            self.previewSeekRequested.emit(seek_row, seek_fraction)
 
-    def keyPressEvent(self, event: QKeyEvent | None) -> None:
-        # Let arrow keys propagate to the parent window for global shortcuts
-        if event is not None and event.key() in (
-            Qt.Key.Key_Left,
-            Qt.Key.Key_Right,
-            Qt.Key.Key_Up,
-            Qt.Key.Key_Down,
-        ):
+    def dropEvent(self, event: QDropEvent | None) -> None:
+        if event is None:
+            return
+        source_row = self._drag_row
+        self._drag_row = -1
+        if source_row < 0:
             event.ignore()
             return
-        super().keyPressEvent(event)
 
-    def mousePressEvent(self, event: QMouseEvent | None) -> None:
-        if event is not None and event.button() == Qt.MouseButton.LeftButton:
-            pt = event.position().toPoint()
-            row = self.rowAt(pt.y())
-            col = self.columnAt(pt.x())
-            if row < 0 or col < 0:
-                if self._preserve_selection_callback is not None and self._preserve_selection_callback():
-                    event.accept()
-                    return
-                self.clearSelection()
-                self.setCurrentCell(-1, -1)
-                event.accept()
-                return
-        super().mousePressEvent(event)
+        drop_pos = event.position().toPoint()
+        target_row = self.rowAt(drop_pos.y())
+        if target_row < 0:
+            target_row = self.rowCount()
+        elif self.dropIndicatorPosition() == QAbstractItemView.DropIndicatorPosition.BelowItem:
+            target_row += 1
 
-
-class KeyboardShortcutsDialog(QDialog):
-    def __init__(
-        self,
-        current_shortcuts: dict[str, str],
-        default_shortcuts: dict[str, str],
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Edit Keyboard Shortcuts")
-        self.resize(520, 280)
-
-        root = QVBoxLayout(self)
-
-        help_label = QLabel("Set shortcut keys. Leave a field empty to disable that shortcut.")
-        help_label.setWordWrap(True)
-        root.addWidget(help_label)
-
-        grid = QGridLayout()
-        root.addLayout(grid)
-
-        self._shortcut_editors: dict[str, QKeySequenceEdit] = {}
-        self._row_labels: dict[str, str] = {}
-        rows = [
-            ("rename", "Rename"),
-            ("delete", "Delete"),
-            ("skip_previous", "Skip to Previous (while playing/paused)"),
-            ("skip_next", "Skip to Next (while playing/paused)"),
-            ("select_up", "Select Previous Row (when stopped)"),
-            ("select_down", "Select Next Row (when stopped)"),
-        ]
-        for row_idx, (key, label_text) in enumerate(rows):
-            label = QLabel(label_text)
-            grid.addWidget(label, row_idx, 0)
-
-            editor = QKeySequenceEdit()
-            editor.setKeySequence(QKeySequence(current_shortcuts.get(key, default_shortcuts.get(key, ""))))
-            grid.addWidget(editor, row_idx, 1)
-            self._shortcut_editors[key] = editor
-            self._row_labels[key] = label_text
-
-            default_label = QLabel(f"Default: {default_shortcuts.get(key, '')}")
-            default_label.setStyleSheet("color: #666;")
-            grid.addWidget(default_label, row_idx, 2)
-
-        controls_row = QHBoxLayout()
-        reset_defaults_btn = QPushButton("Reset to Defaults")
-        reset_defaults_btn.clicked.connect(self._reset_to_defaults)
-        controls_row.addWidget(reset_defaults_btn)
-        controls_row.addStretch()
-        root.addLayout(controls_row)
-
-        self._buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        self._buttons.accepted.connect(self._on_accept)
-        self._buttons.rejected.connect(self.reject)
-        root.addWidget(self._buttons)
-
-        self._default_shortcuts = dict(default_shortcuts)
-
-    def _reset_to_defaults(self) -> None:
-        for key, editor in self._shortcut_editors.items():
-            editor.setKeySequence(QKeySequence(self._default_shortcuts.get(key, "")))
-
-    def selected_shortcuts(self) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for key, editor in self._shortcut_editors.items():
-            out[key] = editor.keySequence().toString(QKeySequence.SequenceFormat.PortableText)
-        return out
-
-    def _find_conflicts(self) -> list[tuple[str, list[str]]]:
-        assignments: dict[str, list[str]] = {}
-        for key, editor in self._shortcut_editors.items():
-            seq_text = editor.keySequence().toString(QKeySequence.SequenceFormat.PortableText).strip()
-            if not seq_text:
-                continue
-            assignments.setdefault(seq_text, []).append(self._row_labels.get(key, key))
-
-        conflicts: list[tuple[str, list[str]]] = []
-        for seq_text, labels in assignments.items():
-            if len(labels) > 1:
-                conflicts.append((seq_text, labels))
-        return conflicts
-
-    def _on_accept(self) -> None:
-        conflicts = self._find_conflicts()
-        if conflicts:
-            lines = ["These shortcuts are assigned to multiple actions:", ""]
-            for seq_text, labels in conflicts:
-                lines.append(f"{seq_text}: {', '.join(labels)}")
-            lines.append("")
-            lines.append("Please resolve conflicts before saving.")
-            QMessageBox.warning(self, "Shortcut Conflict", "\n".join(lines))
-            return
-        self.accept()
+        self.rowMoveRequested.emit(source_row, target_row)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
 
 
 class AboutDialog(QDialog):
-    def __init__(
-        self,
-        *,
-        library_count: int,
-        library_duration_seconds: float,
-        library_size_bytes: int,
-        revision_log_path: Path | None,
-        parent: QWidget | None = None,
-    ) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("About JingleAllTheDay")
+        self.setWindowTitle("About AudioBook Slicer")
         self.setMinimumWidth(620)
-        self._revision_log_path = revision_log_path
 
         icon_path = _HERE / "icon.png"
         self._icon_base = QPixmap(str(icon_path)) if icon_path.is_file() else QPixmap()
@@ -875,55 +278,21 @@ class AboutDialog(QDialog):
         text_layout.setContentsMargins(0, 0, 0, 0)
         text_layout.setSpacing(10)
 
-        self._title_label = QLabel(APP_NAME)
+        self._title_label = QLabel("AudioBook Slicer")
         self._title_label.setStyleSheet("font-size: 20px; font-weight: 700;")
         text_layout.addWidget(self._title_label)
 
-        self._version_label = QLabel(f"Version {APP_VERSION}")
-        self._version_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        intro_layout = QVBoxLayout()
-        intro_layout.setContentsMargins(0, 0, 0, 0)
-        intro_layout.setSpacing(2)
-        intro_layout.addWidget(self._version_label)
-
         self._body_label = QLabel(
-            "\nJingleAllTheDay is a desktop jingle library manager and playback board.\n\n"
-            "You can scan and organize jingles, tag tracks by category, search and filter quickly, "
-            "and trigger reliable playback in Live or Preview mode with selectable output devices.\n\n"
-            "The app is built for fast on-air workflows, with keyboard shortcuts, batch tag tools, "
-            "duplicate detection, and import/export of your tag database."
+            "AudioBook Slicer is a desktop utility for building chaptered audiobook output.\n\n"
+            "You can split M4B files into chapter WAVs, load one or many WAV files, reorder and edit chapter titles, "
+            "manage chapter artwork, and encode a final MP3 with chapter metadata.\n\n"
+            "The application is designed to keep long operations visible and controllable so you can cancel quickly "
+            "and continue working without restarting."
         )
         self._body_label.setWordWrap(True)
         self._body_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self._body_label.setMinimumWidth(430)
-        intro_layout.addWidget(self._body_label)
-        text_layout.addLayout(intro_layout)
-
-        count_label = f"{max(0, int(library_count)):,}"
-        duration_label = _format_duration_hms(max(0.0, float(library_duration_seconds)))
-        size_label = _format_size_label(max(0, int(library_size_bytes)))
-
-        self._library_summary_label = QLabel(
-            "Current Library\n"
-            f"Jingles: {count_label}\n"
-            f"Total Duration: {duration_label}\n"
-            f"Total Size: {size_label}"
-        )
-        self._library_summary_label.setWordWrap(True)
-        self._library_summary_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        text_layout.addWidget(self._library_summary_label)
-
-        button_row = QHBoxLayout()
-        button_row.addStretch(1)
-        self._show_revision_history_btn = QPushButton("Show Revision History")
-        self._show_revision_history_btn.setEnabled(
-            self._revision_log_path is not None and self._revision_log_path.is_file()
-        )
-        if not self._show_revision_history_btn.isEnabled():
-            self._show_revision_history_btn.setToolTip("rev.log was not found in the runtime application folder.")
-        self._show_revision_history_btn.clicked.connect(self._on_show_revision_history)
-        button_row.addWidget(self._show_revision_history_btn)
-        text_layout.addLayout(button_row)
+        text_layout.addWidget(self._body_label, 1)
 
         root.addWidget(icon_wrap, 1)
         root.addWidget(text_wrap, 3)
@@ -931,41 +300,13 @@ class AboutDialog(QDialog):
         text_height = (
             self._title_label.sizeHint().height()
             + text_layout.spacing()
-            + self._version_label.sizeHint().height()
-            + text_layout.spacing()
             + self._body_label.sizeHint().height()
-            + text_layout.spacing()
-            + self._library_summary_label.sizeHint().height()
-            + text_layout.spacing()
-            + self._show_revision_history_btn.sizeHint().height()
         )
         frame_height = root.contentsMargins().top() + root.contentsMargins().bottom() + 8
         initial_height = max(220, text_height + frame_height)
         self.resize(640, initial_height)
         self._refresh_icon()
         self.setFixedSize(self.size())
-
-    def _on_show_revision_history(self) -> None:
-        if self._revision_log_path is None or not self._revision_log_path.is_file():
-            QMessageBox.information(
-                self,
-                "Revision History",
-                "rev.log was not found in the runtime application folder.",
-            )
-            return
-
-        try:
-            revision_text = self._revision_log_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            QMessageBox.critical(
-                self,
-                "Revision History",
-                f"Unable to read revision history file.\n\n{exc}",
-            )
-            return
-
-        dialog = RevisionHistoryDialog(revision_text=revision_text, parent=self)
-        dialog.exec()
 
     def _refresh_icon(self) -> None:
         if self._icon_base.isNull():
@@ -986,2564 +327,3550 @@ class AboutDialog(QDialog):
         self._icon_label.setPixmap(scaled)
 
 
-class RevisionHistoryDialog(QDialog):
-    def __init__(self, *, revision_text: str, parent: QWidget | None = None) -> None:
+class OptionsDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        use_vbr: bool,
+        vbr_quality: int,
+        cbr_bitrate_kbps: int,
+        channels: int,
+        size_limit_text: str,
+        size_unit: str,
+        preview_device: str,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Revision History")
-        self.setMinimumSize(700, 420)
+        self.setWindowTitle("Options")
+        self.setMinimumWidth(560)
 
         root = QVBoxLayout(self)
-        title = QLabel(f"{APP_NAME} {APP_VERSION}")
-        title.setStyleSheet("font-weight: 700;")
-        root.addWidget(title)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
 
-        history_view = QPlainTextEdit(self)
-        history_view.setReadOnly(True)
-        history_view.setPlainText(revision_text)
-        root.addWidget(history_view, 1)
+        encoding_row = QHBoxLayout()
+        encoding_label = QLabel("Encoding")
+        encoding_label.setFixedWidth(90)
+        encoding_row.addWidget(encoding_label)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(self.reject)
+        self._vbr_radio = QRadioButton("VBR")
+        self._cbr_radio = QRadioButton("CBR")
+        self._encode_mode_group = QButtonGroup(self)
+        self._encode_mode_group.addButton(self._vbr_radio)
+        self._encode_mode_group.addButton(self._cbr_radio)
+        encoding_row.addWidget(self._vbr_radio)
+        encoding_row.addWidget(self._cbr_radio)
+
+        self._vbr_quality_label = QLabel("quality level")
+        encoding_row.addWidget(self._vbr_quality_label)
+
+        self._vbr_q_combo = QComboBox()
+        self._vbr_q_combo.setMinimumContentsLength(16)
+        self._vbr_q_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._vbr_q_combo.setMinimumWidth(170)
+        for value in range(10):
+            approx = VBR_QUALITY_BITRATE_HINTS.get(value, "")
+            if approx:
+                label = f"{value} (~{approx})"
+            else:
+                label = str(value)
+            self._vbr_q_combo.addItem(label, value)
+        encoding_row.addWidget(self._vbr_q_combo)
+
+        self._cbr_bitrate_label = QLabel("kbps")
+        encoding_row.addWidget(self._cbr_bitrate_label)
+
+        self._cbr_bitrate_spin = QSpinBox()
+        self._cbr_bitrate_spin.setRange(48, 384)
+        self._cbr_bitrate_spin.setSingleStep(8)
+        self._cbr_bitrate_spin.setFixedWidth(88)
+        encoding_row.addWidget(self._cbr_bitrate_spin)
+        encoding_row.addStretch()
+        root.addLayout(encoding_row)
+
+        channels_row = QHBoxLayout()
+        channels_label = QLabel("Channels")
+        channels_label.setFixedWidth(90)
+        channels_row.addWidget(channels_label)
+
+        self._mono_radio = QRadioButton("Mono")
+        self._stereo_radio = QRadioButton("Stereo")
+        self._channel_group = QButtonGroup(self)
+        self._channel_group.addButton(self._mono_radio)
+        self._channel_group.addButton(self._stereo_radio)
+        channels_row.addWidget(self._mono_radio)
+        channels_row.addWidget(self._stereo_radio)
+        channels_row.addStretch()
+        root.addLayout(channels_row)
+
+        size_limit_row = QHBoxLayout()
+        size_limit_label = QLabel("Size Limit")
+        size_limit_label.setFixedWidth(90)
+        size_limit_row.addWidget(size_limit_label)
+
+        self._size_limit_edit = QLineEdit()
+        self._size_limit_edit.setToolTip("e.g. 1,500,000,000 (blank or 0 = no limit)")
+        self._size_limit_edit.setFixedWidth(185)
+        size_limit_row.addWidget(self._size_limit_edit)
+
+        self._size_unit_group = QButtonGroup(self)
+        for _unit_label in ("b", "kb", "Mb", "Gb", "B", "KB", "MB", "GB"):
+            _rb = QRadioButton(_unit_label)
+            self._size_unit_group.addButton(_rb)
+            size_limit_row.addWidget(_rb)
+
+        size_limit_row.addStretch()
+        root.addLayout(size_limit_row)
+
+        preview_device_row = QHBoxLayout()
+        preview_device_label = QLabel("Preview Device")
+        preview_device_label.setFixedWidth(90)
+        preview_device_row.addWidget(preview_device_label)
+
+        self._preview_device_combo = QComboBox()
+        self._preview_device_combo.setMinimumWidth(320)
+        self._preview_device_combo.setToolTip(
+            "Automatically probed output devices for chapter preview playback."
+        )
+        preview_device_row.addWidget(self._preview_device_combo)
+
+        self._refresh_devices_btn = QPushButton("Refresh Devices")
+        self._refresh_devices_btn.clicked.connect(self._on_refresh_devices_clicked)
+        preview_device_row.addWidget(self._refresh_devices_btn)
+        preview_device_row.addStretch()
+        root.addLayout(preview_device_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
         buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+        self._vbr_q_combo.setCurrentIndex(max(0, min(9, int(vbr_quality))))
+        self._cbr_bitrate_spin.setValue(max(48, min(384, int(cbr_bitrate_kbps))))
+        self._size_limit_edit.setText(size_limit_text)
+        self._populate_preview_devices(selected_device=preview_device)
+
+        if channels == 2:
+            self._stereo_radio.setChecked(True)
+        else:
+            self._mono_radio.setChecked(True)
+
+        found_unit = False
+        for btn in self._size_unit_group.buttons():
+            if btn.text() == size_unit:
+                btn.setChecked(True)
+                found_unit = True
+                break
+        if not found_unit:
+            for btn in self._size_unit_group.buttons():
+                if btn.text() == DEFAULT_SIZE_UNIT:
+                    btn.setChecked(True)
+                    break
+
+        if use_vbr:
+            self._vbr_radio.setChecked(True)
+        else:
+            self._cbr_radio.setChecked(True)
+
+        self._vbr_radio.toggled.connect(self._on_encode_mode_changed)
+        self._cbr_radio.toggled.connect(self._on_encode_mode_changed)
+        self._on_encode_mode_changed()
+
+    def _on_encode_mode_changed(self) -> None:
+        use_vbr = self._vbr_radio.isChecked()
+        self._vbr_quality_label.setVisible(use_vbr)
+        self._vbr_q_combo.setVisible(use_vbr)
+        self._cbr_bitrate_label.setVisible(not use_vbr)
+        self._cbr_bitrate_spin.setVisible(not use_vbr)
+
+    def values(self) -> tuple[bool, int, int, int, str, str, str]:
+        checked = self._size_unit_group.checkedButton()
+        unit = checked.text() if checked is not None else DEFAULT_SIZE_UNIT
+        selected_device = self._preview_device_combo.currentData()
+        preview_device = str(selected_device).strip() if selected_device is not None else ""
+        return (
+            self._vbr_radio.isChecked(),
+            int(self._vbr_q_combo.currentData()),
+            int(self._cbr_bitrate_spin.value()),
+            2 if self._stereo_radio.isChecked() else 1,
+            self._size_limit_edit.text().strip(),
+            unit,
+            preview_device,
+        )
+
+    def _populate_preview_devices(self, selected_device: str) -> None:
+        self._preview_device_combo.blockSignals(True)
+        self._preview_device_combo.clear()
+
+        discovered_names: list[str] = []
+        default_name = ""
+        if _has_qt_multimedia:
+            try:
+                devices = QMediaDevices.audioOutputs()
+                default_name = QMediaDevices.defaultAudioOutput().description().strip()
+                for device in devices:
+                    name = device.description().strip()
+                    if not name or name in discovered_names:
+                        continue
+                    discovered_names.append(name)
+                    label = name
+                    self._preview_device_combo.addItem(label, name)
+            except Exception:
+                pass
+
+        # Empty value means ffplay uses the system default output.
+        default_label = "System Default"
+        if default_name:
+            default_label = f"System Default ({default_name})"
+        self._preview_device_combo.insertItem(0, default_label, "")
+
+        target = selected_device.strip()
+
+        if target:
+            idx = self._preview_device_combo.findData(target)
+            if idx >= 0:
+                self._preview_device_combo.setCurrentIndex(idx)
+            else:
+                self._preview_device_combo.addItem(f"{target} (Unavailable)", target)
+                self._preview_device_combo.setCurrentIndex(self._preview_device_combo.count() - 1)
+        else:
+            self._preview_device_combo.setCurrentIndex(0)
+
+        self._preview_device_combo.blockSignals(False)
+
+    def _on_refresh_devices_clicked(self) -> None:
+        current_data = self._preview_device_combo.currentData()
+        selected_device = str(current_data).strip() if current_data is not None else ""
+        self._populate_preview_devices(selected_device=selected_device)
+
+
+def _sanitize_output_stem(title: str) -> str:
+    sanitized = "".join(
+        "_" if ch in '<>:"/\\|?*' else ch
+        for ch in title.strip().rstrip(". ")
+    )
+    sanitized = sanitized.strip()
+    return sanitized or "output"
+
+
+def _book_title_from_chapter(chapter_title: str) -> str | None:
+    parts = chapter_title.split(" - ", 1)
+    if len(parts) != 2:
+        return None
+    title = parts[0].strip()
+    return title or None
+
+
+def _find_covers_by_title(input_dir: Path) -> dict[str, Path]:
+    """Map case-insensitive image stem -> preferred image path."""
+    image_files = [
+        child
+        for child in input_dir.iterdir()
+        if child.is_file() and child.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    ]
+    by_stem: dict[str, list[Path]] = {}
+    for image in image_files:
+        by_stem.setdefault(image.stem.casefold(), []).append(image)
+
+    preferred_ext = {".jpg": 0, ".jpeg": 1, ".png": 2}
+    resolved: dict[str, Path] = {}
+    for stem, candidates in by_stem.items():
+        candidates.sort(key=lambda p: preferred_ext.get(p.suffix.lower(), 99))
+        resolved[stem] = candidates[0]
+    return resolved
+
+
+def _find_cover_for_source_file(source_file: Path, book_title: str | None) -> Path | None:
+    """Find cover image for a specific source file.
+    
+    Looks in the source file's directory for:
+    1. A file named after the book_title (if provided)
+    2. A file named "Cover"
+    
+    Prefers .jpg over .jpeg over .png.
+    """
+    file_dir = source_file.parent
+    if not book_title:
+        # Only look for generic "cover" names
+        search_names = ["cover"]
+    else:
+        # Look for title-specific first, then generic
+        search_names = [book_title.casefold(), "cover"]
+    
+    preferred_ext = {".jpg": 0, ".jpeg": 1, ".png": 2}
+    
+    for search_name in search_names:
+        candidates: list[Path] = []
+        for ext in [".jpg", ".jpeg", ".png"]:
+            candidate = file_dir / f"{search_name}{ext}"
+            if candidate.exists() and candidate.is_file():
+                candidates.append(candidate)
+        
+        if candidates:
+            # Sort by preferred extension
+            candidates.sort(key=lambda p: preferred_ext.get(p.suffix.lower(), 99))
+            return candidates[0]
+    
+    return None
+
+
+
+def _run_capturing_errors(
+    fn: Callable[..., Any], *args: Any, **kwargs: Any
+) -> tuple[Any, None] | tuple[None, str]:
+    """Call fn(*args, **kwargs).
+
+    Returns (result, None) on success.
+    Returns (None, error_message) if the function raises SystemExit (via fail())
+    or KeyboardInterrupt (can be fired spuriously by Python signal handling
+    when subprocess.run is called on the Qt main thread on Windows).
+    """
+    buf = io.StringIO()
+    old_stderr = sys.stderr
+    sys.stderr = buf
+    try:
+        result = fn(*args, **kwargs)
+        return result, None
+    except (SystemExit, KeyboardInterrupt):
+        msg = buf.getvalue().strip()
+        if msg.startswith("ERROR: "):
+            msg = msg[len("ERROR: "):]
+        return None, msg or "Operation cancelled"
+    finally:
+        sys.stderr = old_stderr
+
+
+class EncodeWorker(QObject):
+    progress = pyqtSignal(int, str, float)
+    finished = pyqtSignal(str, int, object)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        input_wav: Path,
+        output_mp3: Path,
+        chapters: list[Chapter],
+        channels: int,
+        vbr_quality: int,
+        cbr_bitrate: str | None,
+        source_files: dict[int, Path] | None = None,
+        cover_map_override: dict[str, Path] | None = None,
+        reuse_intermediate_wav: Path | None = None,
+    ) -> None:
+        super().__init__()
+        self._input_wav = input_wav
+        self._output_mp3 = output_mp3
+        self._chapters = list(chapters)
+        self._channels = channels
+        self._vbr_quality = vbr_quality
+        self._cbr_bitrate = cbr_bitrate
+        self._source_files = source_files or {}
+        self._cover_map_override = cover_map_override or {}
+        self._reuse_intermediate_wav = reuse_intermediate_wav
+        self._cancel_requested = False
+        self._active_encode_process: subprocess.Popen[str] | None = None
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+        self._force_stop_active_encode_process()
+
+    def _set_active_encode_process(self, process: subprocess.Popen[str]) -> None:
+        self._active_encode_process = process
+
+    def _clear_active_encode_process(self) -> None:
+        self._active_encode_process = None
+
+    def _force_stop_active_encode_process(self) -> None:
+        process = self._active_encode_process
+        if process is None:
+            return
+        if process.poll() is not None:
+            self._active_encode_process = None
+            return
+
+        if sys.platform == "win32":
+            pid = int(process.pid)
+            if pid > 0:
+                run_kwargs: dict[str, Any] = {
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                }
+                if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        check=False,
+                        **run_kwargs,
+                    )
+                    return
+                except OSError:
+                    pass
+
+        process.kill()
+
+    def _run_ffmpeg_cancellable(self, cmd: list[str], failure_prefix: str) -> None:
+        run_kwargs: dict[str, Any] = {
+            "stdout": subprocess.DEVNULL,
+        }
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        with tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(cmd, stderr=stderr_file, **run_kwargs)
+            self._set_active_encode_process(process)
+            try:
+                while True:
+                    if self._cancel_requested:
+                        self._force_stop_active_encode_process()
+                        raise SystemExit
+                    try:
+                        return_code = process.wait(timeout=0.1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            finally:
+                self._clear_active_encode_process()
+
+            stderr_file.seek(0)
+            stderr_text = stderr_file.read().decode("utf-8", errors="replace").strip()
+
+        if return_code != 0:
+            raise SystemExit(
+                f"{failure_prefix} "
+                f"ffmpeg stderr: {stderr_text or '(empty)'}"
+            )
+
+    def _concatenate_individual_files(
+        self,
+        ffmpeg_bin: str,
+        chapters: list[Chapter],
+    ) -> tuple[Path, tempfile.TemporaryDirectory[str]]:
+        """Concatenate individual WAV files into one intermediate WAV."""
+        temp_dir = tempfile.TemporaryDirectory(prefix="wav_concat_")
+        output_wav = Path(temp_dir.name) / "concatenated.wav"
+
+        # Build concat demuxer file
+        concat_file = Path(temp_dir.name) / "concat.txt"
+        concat_lines = []
+        for row in range(len(chapters)):
+            if row in self._source_files:
+                concat_lines.append(f"file '{self._source_files[row]}'")
+        
+        concat_file.write_text("\n".join(concat_lines))
+
+        # Run ffmpeg to concatenate
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_file),
+            "-c",
+            "copy",
+            str(output_wav),
+        ]
+        self._run_ffmpeg_cancellable(cmd, "WAV concatenation failed.")
+
+        return output_wav, temp_dir
+
+    def _build_reordered_wav(
+        self,
+        ffmpeg_bin: str,
+        input_wav: Path,
+        chapters: list[Chapter],
+    ) -> tuple[Path, list[Chapter], float, tempfile.TemporaryDirectory[str]]:
+        temp_dir = tempfile.TemporaryDirectory(prefix="wav_reorder_")
+        reordered_wav = Path(temp_dir.name) / "reordered.wav"
+
+        filter_parts: list[str] = []
+        concat_inputs: list[str] = []
+        for idx, ch in enumerate(chapters):
+            start_sec = f"{ch.start_ms / 1000.0:.6f}"
+            end_sec = f"{ch.end_ms / 1000.0:.6f}"
+            label = f"c{idx}"
+            filter_parts.append(
+                f"[0:a]atrim=start={start_sec}:end={end_sec},asetpts=PTS-STARTPTS[{label}]"
+            )
+            concat_inputs.append(f"[{label}]")
+
+        filter_parts.append(
+            f"{''.join(concat_inputs)}concat=n={len(chapters)}:v=0:a=1[outa]"
+        )
+        filter_complex = ";".join(filter_parts)
+
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            str(input_wav),
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[outa]",
+            "-c:a",
+            "pcm_s16le",
+            str(reordered_wav),
+        ]
+        self._run_ffmpeg_cancellable(cmd, "WAV chapter reordering failed.")
+
+        remapped: list[Chapter] = []
+        cursor_ms = 0
+        for idx, ch in enumerate(chapters, start=1):
+            seg_dur_ms = max(1, ch.end_ms - ch.start_ms)
+            start_ms = cursor_ms
+            end_ms = start_ms + seg_dur_ms
+            remapped.append(
+                Chapter(index=idx, title=ch.title, start_ms=start_ms, end_ms=end_ms)
+            )
+            cursor_ms = end_ms
+
+        return reordered_wav, remapped, cursor_ms / 1000.0, temp_dir
+
+    def _cleanup_tempdir_with_retries(
+        self,
+        temp_dir: tempfile.TemporaryDirectory[str] | None,
+    ) -> None:
+        if temp_dir is None:
+            return
+
+        # On Windows, force-killing ffmpeg can leave file handles open briefly.
+        # Retry cleanup to avoid noisy PermissionError tracebacks from weakref finalizers.
+        last_err: OSError | None = None
+        for _ in range(20):
+            try:
+                temp_dir.cleanup()
+                return
+            except FileNotFoundError:
+                return
+            except PermissionError as exc:
+                last_err = exc
+                time.sleep(0.1)
+            except OSError as exc:
+                last_err = exc
+                break
+
+        if last_err is not None:
+            try:
+                self.progress.emit(
+                    0,
+                    f"Cleanup warning: temporary files could not be fully removed ({last_err})",
+                    -1.0,
+                )
+            except Exception:
+                pass
+
+    def _copy_intermediate_for_reuse(self, source_wav: Path) -> Path | None:
+        """Copy intermediate WAV to a stable temporary path for optional reuse."""
+        target_fd, target_str = tempfile.mkstemp(
+            prefix="audiobookslicer_intermediate_",
+            suffix=".wav",
+        )
+        try:
+            os.close(target_fd)
+        except OSError:
+            pass
+
+        try:
+            target = Path(target_str)
+            with source_wav.open("rb") as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+            return target
+        except OSError:
+            return None
+
+    def run(self) -> None:
+        stderr_buf = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = stderr_buf
+        reorder_tempdir: tempfile.TemporaryDirectory[str] | None = None
+        concat_tempdir: tempfile.TemporaryDirectory[str] | None = None
+        generated_intermediate: Path | None = None
+        try:
+            self.progress.emit(0, "Preparing encoder…", -1.0)
+            ffmpeg_bin = ensure_executable("ffmpeg")
+            ffprobe_bin = ensure_executable("ffprobe")
+
+            chapters = list(self._chapters)
+            if self._reuse_intermediate_wav is not None:
+                input_for_encode = self._reuse_intermediate_wav
+                if not input_for_encode.exists():
+                    raise SystemExit(
+                        f"Saved intermediate WAV is missing: {input_for_encode}"
+                    )
+                self.progress.emit(2, "Using saved intermediate WAV…", -1.0)
+                sample_rate, _markers = read_riff_chunks(input_for_encode)
+                duration_sec, _ = probe_audio_info(ffprobe_bin, input_for_encode)
+                if self._source_files:
+                    cover_root = next(iter(self._source_files.values())).parent
+                else:
+                    cover_root = self._input_wav.parent
+                chapters_for_encode = chapters
+                duration_for_encode = duration_sec
+            else:
+                if self._source_files:
+                    if self._cancel_requested:
+                        raise SystemExit
+                    self.progress.emit(2, "Concatenating individual WAV files…", -1.0)
+                    input_for_encode, concat_tempdir = self._concatenate_individual_files(
+                        ffmpeg_bin, chapters
+                    )
+                    sample_rate, _markers = read_riff_chunks(input_for_encode)
+                    duration_sec, _ = probe_audio_info(ffprobe_bin, input_for_encode)
+                    cover_root = next(iter(self._source_files.values())).parent
+                else:
+                    self.progress.emit(2, "Reading markers…", -1.0)
+                    sample_rate, _markers = read_riff_chunks(self._input_wav)
+                    duration_sec, _ = probe_audio_info(ffprobe_bin, self._input_wav)
+                    input_for_encode = self._input_wav
+                    cover_root = self._input_wav.parent
+
+                chapters_for_encode = chapters
+                duration_for_encode = duration_sec
+                needs_reorder = any(
+                    chapters[i].start_ms > chapters[i + 1].start_ms
+                    for i in range(len(chapters) - 1)
+                )
+                if needs_reorder:
+                    if self._cancel_requested:
+                        raise SystemExit
+                    self.progress.emit(4, "Reordering chapters in WAV…", -1.0)
+                    (
+                        input_for_encode,
+                        chapters_for_encode,
+                        duration_for_encode,
+                        reorder_tempdir,
+                    ) = self._build_reordered_wav(ffmpeg_bin, input_for_encode, chapters)
+
+                if input_for_encode != self._input_wav:
+                    generated_intermediate = input_for_encode
+
+            if self._cover_map_override:
+                cover_map = dict(self._cover_map_override)
+            else:
+                cover_map = resolve_cover_images(cover_root, chapters)
+
+            self.progress.emit(5, "Encoding audio…", -1.0)
+
+            def _progress_callback(percent: float, status_line: str, out_time_sec: float) -> None:
+                pct = int(max(0.0, min(100.0, percent)))
+                self.progress.emit(pct, f"Encoding… {status_line.strip()}", out_time_sec)
+
+            actual_size_bytes = encode_output(
+                ffmpeg_bin=ffmpeg_bin,
+                input_file=input_for_encode,
+                chapters=chapters_for_encode,
+                duration_sec=duration_for_encode,
+                output_file=self._output_mp3,
+                channels=self._channels,
+                vbr_quality=self._vbr_quality,
+                cbr_bitrate=self._cbr_bitrate,
+                cover_map=cover_map,
+                progress_callback=_progress_callback,
+                cancel_requested=lambda: self._cancel_requested,
+                on_process_started=self._set_active_encode_process,
+                on_process_finished=self._clear_active_encode_process,
+                sample_rate=sample_rate,
+            )
+            self.progress.emit(100, "Encoding complete", -1.0)
+            saved_intermediate: Path | None = None
+            if generated_intermediate is not None:
+                saved_intermediate = self._copy_intermediate_for_reuse(generated_intermediate)
+
+            self.finished.emit(
+                f"Created: {self._output_mp3} ({format_bytes(actual_size_bytes)})",
+                actual_size_bytes,
+                {
+                    "intermediate_wav": str(saved_intermediate) if saved_intermediate else "",
+                    "chapters_for_encode": list(chapters_for_encode),
+                },
+            )
+        except SystemExit:
+            if self._cancel_requested:
+                self.failed.emit("Encode cancelled by user.")
+            else:
+                msg = stderr_buf.getvalue().strip()
+                if msg.startswith("ERROR: "):
+                    msg = msg[len("ERROR: "):]
+                self.failed.emit(msg or "Encoding failed.")
+        except Exception as exc:
+            self.failed.emit(str(exc) or "Unexpected encoding error.")
+        finally:
+            self._cleanup_tempdir_with_retries(reorder_tempdir)
+            self._cleanup_tempdir_with_retries(concat_tempdir)
+            sys.stderr = old_stderr
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("JingleAllTheDay")
-        self.resize(1200, 740)
-        _icon_path = _HERE / "icon.png"
-        if _icon_path.exists():
-            self.setWindowIcon(QIcon(str(_icon_path)))
+        self.setWindowTitle("AudioBook Slicer")
+        icon_path = _HERE / "icon.png"
+        if icon_path.exists() and icon_path.is_file():
+            self.setWindowIcon(QIcon(str(icon_path)))
+        self.resize(900, 600)
 
-        app_data_location = QStandardPaths.writableLocation(
-            QStandardPaths.StandardLocation.AppDataLocation
-        )
-        self._app_data_dir = Path(app_data_location)
-        self._app_data_dir.mkdir(parents=True, exist_ok=True)
-        self._settings = self._create_settings_store()
-        self._output_device = str(self._settings.value("options/outputDevice", "")).strip()
-        self._preview_output_device = str(self._settings.value("options/previewOutputDevice", "")).strip()
-        self._live_volume_percent = _coerce_volume_percent(
-            self._settings.value("options/liveVolumePercent", 100)
-        )
-        self._preview_volume_percent = _coerce_volume_percent(
-            self._settings.value("options/previewVolumePercent", 100)
-        )
-        self._samples_dir: Path | None = self._load_samples_dir()
-        self._auto_folder_tags: bool = self._load_auto_folder_tags()
-        self._watch_library_changes: bool = self._load_watch_library_changes()
-        self._keyboard_shortcuts = self._load_keyboard_shortcuts()
-
-        self._rename_action: QAction | None = None
-        self._delete_action: QAction | None = None
-
-        library_path = self._app_data_dir / "jingle-library.json"
-        self._store = LibraryStore(library_path)
-
-        self._records: list[JingleRecord] = []
-        self._visible_indices: list[int] = []
-        self._updating_table = False
-        self._is_rescanning = False
-
-        self._player: QMediaPlayer | None = None
-        self._audio_output: QAudioOutput | None = None
-        self._is_muted = False
-        self._slider_pressed = False
-        self._playback_mode = "off"
-        self._continuous_queue: list[int] = []
-        self._continuous_queue_position = -1
-        self._current_playing_name = ""
-        self._is_preview_mode = False
-        self._loop_breath_effect: QGraphicsOpacityEffect | None = None
-        self._loop_breath_anim: QPropertyAnimation | None = None
-        self._play_stop_breath_effect: QGraphicsOpacityEffect | None = None
-        self._play_stop_breath_anim: QPropertyAnimation | None = None
-        self._stop_btn_breath_effect: QGraphicsOpacityEffect | None = None
-        self._stop_btn_breath_anim: QPropertyAnimation | None = None
-        self._mode_live_breath_effect: QGraphicsOpacityEffect | None = None
-        self._mode_live_breath_anim: QPropertyAnimation | None = None
-
+        self._wav_path: Path | None = None
+        self._output_dir: Path | None = None
+        self._chapters: list[Chapter] = []
+        self._original_chapters: list[Chapter] = []
+        self._missing_cover_rows: set[int] = set()
+        self._row_cover_paths: dict[int, Path] = {}
+        self._source_files: dict[int, Path] = {}  # Maps row -> individual WAV file
+        self._is_individual_files_mode: bool = False  # True if using individual files
+        self._cached_intermediate_wav: Path | None = None
+        self._cached_intermediate_signature: str | None = None
+        self._cached_intermediate_source_chapters: list[Chapter] = []
+        self._cached_intermediate_encode_chapters: list[Chapter] = []
+        self._cached_intermediate_source_files: dict[int, Path] = {}
+        self._cached_intermediate_cover_paths: dict[int, Path] = {}
+        self._cached_intermediate_missing_rows: set[int] = set()
+        self._preview_base_pixmap: QPixmap | None = None
+        self._next_cover_action = "all"
+        self._encode_mode_group: QButtonGroup | None = None
+        self._channel_group: QButtonGroup | None = None
+        self._size_unit_group: QButtonGroup | None = None
+        self._encode_thread: QThread | None = None
+        self._encode_worker: EncodeWorker | None = None
+        self._initial_splitter_sizes: tuple[int, int] = (180, 460)
+        self._top_panel: QWidget | None = None
+        self._splitter_top_padding_px = 8
+        self._default_splitter_top_px: int | None = None
+        self._splitter_reset_pending = False
+        self._encode_progress_row: int | None = None
+        self._encode_progress_timeline: list[Chapter] = []
+        self._is_populating_table = False
+        self._was_maximized = self.isMaximized()
+        self._remembered_conflict_path: Path | None = None
+        self._remembered_conflict_choice: str | None = None
+        self._settings = QSettings("AudioBookSlicer", "AudioBookSlicer")
+        self._use_vbr = DEFAULT_USE_VBR
+        self._vbr_quality = DEFAULT_VBR_QUALITY
+        self._cbr_bitrate_kbps = DEFAULT_CBR_BITRATE
+        self._channels = DEFAULT_CHANNELS
+        self._size_limit_text = DEFAULT_SIZE_LIMIT_TEXT
+        self._size_limit_unit = DEFAULT_SIZE_UNIT
+        self._preview_device = DEFAULT_PREVIEW_DEVICE
+        self._load_options_from_settings()
+        self._action_open_wav: QAction | None = None
+        self._action_add_wav_files: QAction | None = None
+        self._action_import_playlist: QAction | None = None
+        self._action_export_playlist: QAction | None = None
+        self._action_reset: QAction | None = None
+        self._action_reset_markers: QAction | None = None
+        self._action_remove_selected: QAction | None = None
+        self._action_split_m4b: QAction | None = None
+        self._action_rename_files: QAction | None = None
+        self._action_options: QAction | None = None
+        self._action_exit: QAction | None = None
+        self._action_about: QAction | None = None
+        self._split_process: QProcess | None = None
+        self._split_cancelled: bool = False
+        self._split_output_lines: list[str] = []
+        self._split_output_files: list[Path] = []
+        self._split_output_buffer: str = ""
+        self._split_output_dir: Path | None = None
+        self._preview_process: subprocess.Popen[str] | None = None
+        self._preview_player: QMediaPlayer | None = None
+        self._preview_audio_output: QAudioOutput | None = None
+        self._preview_row: int | None = None
+        self._preview_started_monotonic = 0.0
+        self._preview_duration_sec = 0.0
+        self._preview_start_offset_ms = 0
+        self._preview_end_offset_ms = 0
+        self._preview_wait_start_deadline = 0.0
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setInterval(200)
+        self._preview_timer.timeout.connect(self._on_preview_timer_tick)
         if _has_qt_multimedia:
-            self._player = QMediaPlayer(self)
-            self._audio_output = QAudioOutput(self)
-            self._player.setAudioOutput(self._audio_output)
-            self._apply_output_device()
+            self._preview_player = QMediaPlayer(self)
+            self._preview_audio_output = QAudioOutput(self)
+            self._preview_player.setAudioOutput(self._preview_audio_output)
 
-        central = QWidget(self)
-        self._central_widget = central
-        app = QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
+        # ── Central widget ────────────────────────────────────────────────────
+        central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root.setSpacing(6)
 
-        filter_row = QHBoxLayout()
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Search by jingle name, tags, or path")
-        self._search_edit.textChanged.connect(self._apply_filters)
-        filter_row.addWidget(self._search_edit, 2)
+        # ── Top bar: file picker ──────────────────────────────────────────────
+        top = QHBoxLayout()
 
-        self._search_scope_combo = QComboBox()
-        self._search_scope_combo.addItem("Name + Path + Tag", "all")
-        self._search_scope_combo.addItem("Name Only", "name")
-        self._search_scope_combo.addItem("Tag Only", "tag")
-        self._search_scope_combo.addItem("Path Only", "path")
-        self._search_scope_combo.currentIndexChanged.connect(self._on_search_scope_changed)
-        self._search_scope_combo.setToolTip("Choose what fields the search box matches.")
-        filter_row.addWidget(self._search_scope_combo, 0)
+        self._reset_btn = QPushButton("Reset")
+        self._reset_btn.setFixedWidth(70)
+        self._reset_btn.clicked.connect(self._on_reset_clicked)
+        top.addWidget(self._reset_btn)
 
-        self._category_filter_edit = QLineEdit()
-        self._category_filter_edit.setPlaceholderText("Filter categories (comma-separated)")
-        self._category_filter_edit.textChanged.connect(self._apply_filters)
-        filter_row.addWidget(self._category_filter_edit, 1)
+        self._reset_markers_btn = QPushButton("Reset Markers")
+        self._reset_markers_btn.setFixedWidth(100)
+        self._reset_markers_btn.setEnabled(False)
+        self._reset_markers_btn.clicked.connect(self._on_reset_markers_clicked)
+        top.addWidget(self._reset_markers_btn)
 
-        self._category_filter_mode = QComboBox()
-        self._category_filter_mode.addItem("Match Any", "any")
-        self._category_filter_mode.addItem("Match All", "all")
-        self._category_filter_mode.setCurrentIndex(1)
-        self._category_filter_mode.currentIndexChanged.connect(self._apply_filters)
-        filter_row.addWidget(self._category_filter_mode, 0)
+        self._remove_chapter_btn = QPushButton("Remove Selected")
+        self._remove_chapter_btn.setFixedWidth(120)
+        self._remove_chapter_btn.setEnabled(False)
+        self._remove_chapter_btn.clicked.connect(self._on_remove_selected_chapter)
+        top.addWidget(self._remove_chapter_btn)
 
-        root.addLayout(filter_row)
+        self._covers_btn = QPushButton("Process Covers")
+        self._covers_btn.setFixedWidth(120)
+        self._covers_btn.setEnabled(False)
+        self._covers_btn.clicked.connect(self._on_process_covers)
+        top.addWidget(self._covers_btn)
 
-        chips_row = QHBoxLayout()
-        chips_label = QLabel("Active Filters")
-        chips_label.setFixedWidth(100)
-        chips_row.addWidget(chips_label)
-
-        self._chips_scroll = QScrollArea()
-        self._chips_scroll.setWidgetResizable(True)
-        self._chips_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._chips_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._chips_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        self._chips_scroll.setMinimumHeight(34)
-        self._chips_scroll.setMaximumHeight(40)
-
-        self._chips_container = QWidget()
-        self._chips_layout = QHBoxLayout(self._chips_container)
-        self._chips_layout.setContentsMargins(0, 0, 0, 0)
-        self._chips_layout.setSpacing(6)
-        self._chips_layout.addStretch()
-        self._chips_scroll.setWidget(self._chips_container)
-
-        chips_row.addWidget(self._chips_scroll, 1)
-
-        self._clear_filters_btn = QPushButton("Clear All")
-        self._clear_filters_btn.setToolTip("Remove all active category filter tags")
-        self._clear_filters_btn.clicked.connect(self._clear_all_filter_tags)
-        self._clear_filters_btn.setEnabled(False)
-        chips_row.addWidget(self._clear_filters_btn)
-
-        root.addLayout(chips_row)
-
-        bulk_grid = QGridLayout()
-        bulk_grid.addWidget(QLabel("Set Categories"), 0, 0)
-        self._bulk_category_edit = QLineEdit()
-        self._bulk_category_edit.setPlaceholderText("Comma-separated, e.g. Holiday, Radio")
-        bulk_grid.addWidget(self._bulk_category_edit, 0, 1)
-
-        self._bulk_mode_combo = QComboBox()
-        self._bulk_mode_combo.addItem("Replace tags", "replace")
-        self._bulk_mode_combo.addItem("Append tags", "append")
-        self._bulk_mode_combo.addItem("Remove tags", "remove")
-        self._bulk_mode_combo.setCurrentIndex(1)
-        self._bulk_mode_combo.setToolTip("Choose how bulk tags are applied to selected rows.")
-        bulk_grid.addWidget(self._bulk_mode_combo, 0, 2)
-
-        self._update_from_folders_selected_btn = QPushButton("From Folders (Selected)")
-        self._update_from_folders_selected_btn.setToolTip(
-            "Update selected rows from folder titles using preserve/overwrite mode."
+        self._file_label = QLabel("No file selected")
+        self._file_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
-        self._update_from_folders_selected_btn.clicked.connect(
-            self._on_update_selected_from_folders_clicked
+        top.addWidget(self._file_label)
+
+        # ── Output settings + cover preview ─────────────────────────────────
+        top_settings_row = QHBoxLayout()
+        top_settings_row.setAlignment(Qt.AlignmentFlag.AlignTop)
+        top_settings_row.setContentsMargins(0, 0, 0, 0)
+        top_settings_row.setSpacing(6)
+
+        settings_left = QVBoxLayout()
+        settings_left.setSpacing(6)
+        settings_left.setAlignment(Qt.AlignmentFlag.AlignTop)
+        settings_left.addLayout(top)
+
+        title_row = QHBoxLayout()
+
+        title_label = QLabel("Book Title")
+        title_label.setFixedWidth(90)
+        title_row.addWidget(title_label)
+
+        self._book_title_edit = QLineEdit()
+        self._book_title_edit.setPlaceholderText("Book title for MP3 tags")
+        self._book_title_edit.textChanged.connect(self._on_book_title_changed)
+        title_row.addWidget(self._book_title_edit)
+
+        settings_left.addLayout(title_row)
+
+        output_row = QHBoxLayout()
+
+        output_label = QLabel("Output File")
+        output_label.setFixedWidth(90)
+        output_row.addWidget(output_label)
+
+        self._output_path_edit = QLineEdit()
+        self._output_path_edit.setReadOnly(True)
+        output_row.addWidget(self._output_path_edit)
+
+        self._save_as_btn = QPushButton("Save As")
+        self._save_as_btn.setEnabled(False)
+        self._save_as_btn.clicked.connect(self._on_save_as)
+        output_row.addWidget(self._save_as_btn)
+
+        settings_left.addLayout(output_row)
+
+        duration_row = QHBoxLayout()
+
+        duration_label = QLabel("Duration")
+        duration_label.setFixedWidth(90)
+        duration_row.addWidget(duration_label)
+
+        self._duration_edit = QLineEdit()
+        self._duration_edit.setReadOnly(True)
+        duration_row.addWidget(self._duration_edit)
+        duration_row.addStretch()
+
+        settings_left.addLayout(duration_row)
+
+        preview_row = QHBoxLayout()
+
+        preview_label = QLabel("Preview")
+        preview_label.setFixedWidth(90)
+        preview_row.addWidget(preview_label)
+
+        self._preview_btn = QPushButton("Start Preview")
+        self._preview_btn.setEnabled(False)
+        self._preview_btn.clicked.connect(self._on_preview_clicked)
+        preview_row.addWidget(self._preview_btn)
+
+        self._preview_counter_label = QLabel(_format_counter_label(0.0, 0.0))
+        preview_row.addWidget(self._preview_counter_label)
+        preview_row.addStretch()
+
+        settings_left.addLayout(preview_row)
+
+        encode_row = QHBoxLayout()
+
+        encode_label = QLabel("")
+        encode_label.setFixedWidth(90)
+        encode_row.addWidget(encode_label)
+
+        self._encode_btn = QPushButton("Encode MP3")
+        self._encode_btn.setEnabled(False)
+        self._encode_btn.clicked.connect(self._on_encode_clicked)
+        self._encode_btn.setStyleSheet(
+            "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; }"
+            "QPushButton:hover { background-color: #388e3c; }"
+            "QPushButton:disabled { background-color: #9e9e9e; color: #e0e0e0; }"
         )
-        bulk_grid.addWidget(self._update_from_folders_selected_btn, 0, 3)
+        encode_row.addWidget(self._encode_btn)
 
-        self._apply_selected_btn = QPushButton("Apply To Selected")
-        self._apply_selected_btn.clicked.connect(self._on_apply_bulk_to_selected)
-        bulk_grid.addWidget(self._apply_selected_btn, 0, 4)
+        self._encode_progress = QProgressBar()
+        self._encode_progress.setRange(0, 100)
+        self._encode_progress.setValue(0)
+        self._encode_progress.setTextVisible(True)
+        self._encode_progress.setFormat("%p%")
+        self._encode_progress.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        encode_row.addWidget(self._encode_progress)
 
-        root.addLayout(bulk_grid)
+        settings_left.addLayout(encode_row)
+        settings_left.addStretch(1)
+        top_settings_row.addLayout(settings_left, 3)
 
-        self._table = DeselectableTableWidget(0, 3)
-        self._table.set_preserve_selection_callback(self._should_preserve_selected_row)
-        self._table.setHorizontalHeaderLabels(["Jingle", "Categories", "Folder"])
-        self._table.itemChanged.connect(self._on_table_item_changed)
-        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        preview_right = QVBoxLayout()
+        preview_right.setContentsMargins(0, 0, 0, 0)
+        preview_right.setSpacing(0)
+        preview_right.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+
+        preview_label = QLabel("Cover Preview")
+        preview_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        preview_right.addWidget(preview_label)
+
+        self._cover_preview = QLabel("No cover selected")
+        self._cover_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._cover_preview.setMinimumSize(220, 120)
+        self._cover_preview.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        preview_right.addWidget(self._cover_preview, 1)
+
+        top_settings_row.addLayout(preview_right, 1)
+        top_panel = QWidget()
+        top_panel_layout = QVBoxLayout(top_panel)
+        top_panel_layout.setContentsMargins(0, 0, 0, 0)
+        top_panel_layout.setSpacing(0)
+        top_panel_layout.addLayout(top_settings_row)
+        self._top_panel = top_panel
+
+        # ── Chapter table ─────────────────────────────────────────────────────
+        self._table = ReorderableTableWidget()
+        self._table.setColumnCount(5)
+        self._table.setHorizontalHeaderLabels(["#", "Title", "Start", "End", "Cover"])
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setDragEnabled(True)
+        self._table.setAcceptDrops(True)
+        self._table.setDropIndicatorShown(True)
+        self._table.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self._table.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self._table.setDragDropOverwriteMode(False)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._table.setAlternatingRowColors(True)
-        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._table.customContextMenuRequested.connect(self._on_table_context_menu_requested)
-        header = self._table.horizontalHeader()
-        if header is not None:
-            header.setStretchLastSection(False)
-            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-
-        self._table.setColumnWidth(1, 120)
-        self._table.setColumnWidth(2, 160)
         self._table.itemSelectionChanged.connect(self._on_table_selection_changed)
-        self._table.itemDoubleClicked.connect(self._on_table_item_double_clicked)
-        root.addWidget(self._table, 1)
+        self._table.itemChanged.connect(self._on_table_item_changed)
+        self._table.rowMoveRequested.connect(self._on_table_row_move_requested)
+        self._table.previewSeekRequested.connect(self._on_preview_seek_requested)
+        self._table.setItemDelegateForColumn(1, ChapterProgressDelegate(self._table))
+        vh = self._table.verticalHeader()
+        if vh is not None:
+            vh.setVisible(False)
 
-        playback_row = QHBoxLayout()
-        self._play_btn = QPushButton("Play Selected")
-        self._play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._play_btn.clicked.connect(self._on_play_clicked)
-        playback_row.addWidget(self._play_btn)
-        self._set_play_button_state(False)
+        hdr = self._table.horizontalHeader()
+        if hdr is None:
+            raise RuntimeError("Table has no horizontal header")
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self._table.setColumnWidth(4, THUMB_SIZE + 8)
 
-        self._stop_btn = QPushButton("Stop")
-        self._stop_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._stop_btn.setStyleSheet(
-            "QPushButton { background-color: #c62828; color: white; font-weight: bold; }"
-            "QPushButton:hover { background-color: #d32f2f; }"
-        )
-        self._stop_btn.clicked.connect(self._on_stop_clicked)
-        playback_row.addWidget(self._stop_btn)
+        bottom_panel = QWidget()
+        bottom_panel_layout = QVBoxLayout(bottom_panel)
+        bottom_panel_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_panel_layout.setSpacing(0)
+        bottom_panel_layout.addWidget(self._table)
 
-        self._mute_btn = QPushButton("Mute")
-        self._mute_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._mute_btn.clicked.connect(self._on_mute_clicked)
-        playback_row.addWidget(self._mute_btn)
-        self._refresh_mute_button_state()
+        self._main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._main_splitter.setChildrenCollapsible(False)
+        self._main_splitter.setHandleWidth(8)
+        self._main_splitter.addWidget(top_panel)
+        self._main_splitter.addWidget(bottom_panel)
+        self._main_splitter.setStretchFactor(0, 0)
+        self._main_splitter.setStretchFactor(1, 1)
+        self._main_splitter.setSizes(list(self._initial_splitter_sizes))
+        self._main_splitter.splitterMoved.connect(self._on_main_splitter_moved)
 
-        self._loop_btn = QPushButton("Loop Off")
-        self._loop_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._loop_btn.clicked.connect(self._on_loop_clicked)
-        playback_row.addWidget(self._loop_btn)
-        self._refresh_playback_mode_button()
+        root.addWidget(self._main_splitter)
 
-        self._mode_btn = QPushButton("Mode: Live")
-        self._mode_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._mode_btn.setCheckable(True)
-        self._mode_btn.toggled.connect(self._on_mode_toggled)
-        playback_row.addWidget(self._mode_btn)
-        self._refresh_mode_toggle_state(notify_if_disabled=False)
+        # Apply tight splitter sizing after Qt has finalized widget geometry.
+        QTimer.singleShot(0, self._apply_pending_splitter_reset)
 
-        self._position_slider = QSlider(Qt.Orientation.Horizontal)
-        self._position_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._position_slider.setRange(0, 0)
-        self._position_slider.sliderPressed.connect(self._on_slider_pressed)
-        self._position_slider.sliderReleased.connect(self._on_slider_released)
-        playback_row.addWidget(self._position_slider, 1)
-
-        self._time_label = QLabel("00:00 / 00:00")
-        self._time_label.setFixedWidth(110)
-        playback_row.addWidget(self._time_label)
-
-        self._volume_mode_label = QLabel("Live Vol")
-        self._volume_mode_label.setFixedWidth(70)
-        playback_row.addWidget(self._volume_mode_label)
-
-        self._volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self._volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._volume_slider.setRange(0, 100)
-        self._volume_slider.setPageStep(5)
-        self._volume_slider.setFixedWidth(140)
-        self._volume_slider.valueChanged.connect(self._on_volume_slider_changed)
-        playback_row.addWidget(self._volume_slider)
-
-        self._volume_value_label = QLabel("100%")
-        self._volume_value_label.setFixedWidth(44)
-        playback_row.addWidget(self._volume_value_label)
-
-        self._refresh_volume_controls()
-
-        root.addLayout(playback_row)
-
-        self._status = QStatusBar(self)
+        # ── Status bar ────────────────────────────────────────────────────────
+        self._status = QStatusBar()
         self.setStatusBar(self._status)
+        self._build_menu_bar()
+        self._status.showMessage("Open a WAV file to begin.")
+        self._save_options_to_settings()
 
-        self._library_watcher = QFileSystemWatcher(self)
-        self._library_watcher.directoryChanged.connect(self._on_library_watch_path_changed)
-        self._library_watcher.fileChanged.connect(self._on_library_watch_path_changed)
-        self._watch_rescan_timer = QTimer(self)
-        self._watch_rescan_timer.setSingleShot(True)
-        self._watch_rescan_timer.timeout.connect(self._on_library_watch_rescan_timeout)
+    # ── Slots ─────────────────────────────────────────────────────────────────
 
-        self._build_menu()
-        self._connect_player_signals()
-        self._on_search_scope_changed()
-        self._refresh_filter_chips([])
-
-        # Defer the initial scan so the window can render immediately.
-        QTimer.singleShot(0, self._maybe_run_first_time_setup)
-
-    def eventFilter(self, watched: QObject | None, event: QEvent | None) -> bool:
-        if (
-            isinstance(watched, QWidget)
-            and event is not None
-            and event.type() == QEvent.Type.MouseButtonPress
-            and isinstance(event, QMouseEvent)
-            and event.button() == Qt.MouseButton.LeftButton
-        ):
-            widget = watched
-            preserve_selection_widgets = (
-                self._table,
-                self._play_btn,
-                self._stop_btn,
-                self._mute_btn,
-                self._loop_btn,
-                self._mode_btn,
-                self._bulk_category_edit,
-                self._bulk_mode_combo,
-                self._apply_selected_btn,
-                self._update_from_folders_selected_btn,
-            )
-            preserve_selection = any(
-                widget is candidate or candidate.isAncestorOf(widget)
-                for candidate in preserve_selection_widgets
-            )
-            if widget.inherits("QMenuBar") or widget.inherits("QMenu"):
-                preserve_selection = True
-            if widget.window() is self and not preserve_selection:
-                if self._should_preserve_selected_row():
-                    return super().eventFilter(watched, event)
-                self._table.clearSelection()
-                self._table.setCurrentCell(-1, -1)
-                self._refresh_status_summary()
-        if event is not None and event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
-            if self._handle_media_key_event(event):
-                return True
-        return super().eventFilter(watched, event)
-
-    def _should_preserve_selected_row(self) -> bool:
-        table = getattr(self, "_table", None)
-        return (
-            self._player is not None
-            and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-            and table is not None
-            and bool(table.selectedItems())
-        )
-
-    def _is_playback_active(self) -> bool:
-        return (
-            self._player is not None
-            and self._player.playbackState()
-            in (
-                QMediaPlayer.PlaybackState.PlayingState,
-                QMediaPlayer.PlaybackState.PausedState,
-            )
-        )
-
-    def _handle_media_key_event(self, event: QKeyEvent) -> bool:
-        if self._player is None:
-            return False
-
-        key = event.key()
-        if key in MEDIA_TOGGLE_PLAYBACK_KEYS:
-            self._toggle_play_pause()
-            event.accept()
-            return True
-        if key in MEDIA_PLAY_KEYS:
-            self._resume_or_start_playback()
-            event.accept()
-            return True
-        if key in MEDIA_PAUSE_KEYS:
-            self._pause_playback()
-            event.accept()
-            return True
-        if key in MEDIA_NEXT_KEYS and self._is_playback_active():
-            self._skip_to_next()
-            event.accept()
-            return True
-        if key in MEDIA_PREVIOUS_KEYS and self._is_playback_active():
-            self._skip_to_previous()
-            event.accept()
-            return True
-        return False
-
-    def _toggle_play_pause(self) -> None:
-        if self._player is None:
-            return
-        state = self._player.playbackState()
-        if state == QMediaPlayer.PlaybackState.PlayingState:
-            self._player.pause()
-            self._status.showMessage("Playback paused.")
-            return
-        if state == QMediaPlayer.PlaybackState.PausedState:
-            self._player.play()
-            self._status.showMessage("Playback resumed.")
-            return
-        self._on_play_clicked()
-
-    def _resume_or_start_playback(self) -> None:
-        if self._player is None:
-            return
-        if self._player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
-            self._player.play()
-            self._status.showMessage("Playback resumed.")
-            return
-        if self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            self._on_play_clicked()
-
-    def _pause_playback(self) -> None:
-        if self._player is None:
-            return
-        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self._player.pause()
-            self._status.showMessage("Playback paused.")
-
-    def _refresh_mute_button_state(self) -> None:
-        if self._is_muted:
-            self._mute_btn.setText("Unmute")
-            self._mute_btn.setStyleSheet(
-                "QPushButton { background-color: #546e7a; color: white; font-weight: bold; }"
-                "QPushButton:hover { background-color: #607d8b; }"
-            )
-        else:
-            self._mute_btn.setText("Mute")
-            self._mute_btn.setStyleSheet(
-                "QPushButton { background-color: #455a64; color: white; font-weight: bold; }"
-                "QPushButton:hover { background-color: #546e7a; }"
-            )
-
-    def _set_muted(self, muted: bool) -> None:
-        self._is_muted = muted
-        if self._audio_output is not None:
-            self._audio_output.setMuted(muted)
-        self._refresh_mute_button_state()
-
-    def _on_mute_clicked(self) -> None:
-        if self._audio_output is None:
-            self._status.showMessage("Playback unavailable: PyQt6 multimedia is not installed.")
-            return
-        self._set_muted(not self._is_muted)
-        self._status.showMessage("Audio muted." if self._is_muted else "Audio unmuted.")
-
-    def _active_volume_percent(self) -> int:
-        if self._is_preview_mode and self._can_use_preview_mode():
-            return self._preview_volume_percent
-        return self._live_volume_percent
-
-    def _save_volume_settings(self) -> None:
-        self._settings.setValue("options/liveVolumePercent", self._live_volume_percent)
-        self._settings.setValue("options/previewVolumePercent", self._preview_volume_percent)
-
-    def _apply_active_volume(self) -> None:
-        if self._audio_output is None:
-            return
-        self._audio_output.setVolume(self._active_volume_percent() / 100.0)
-
-    def _refresh_volume_controls(self) -> None:
-        if not hasattr(self, "_volume_slider"):
-            return
-        mode_text = "Preview Vol" if self._is_preview_mode and self._can_use_preview_mode() else "Live Vol"
-        self._volume_mode_label.setText(mode_text)
-        value = self._active_volume_percent()
-        self._volume_slider.blockSignals(True)
-        self._volume_slider.setValue(value)
-        self._volume_slider.blockSignals(False)
-        self._volume_value_label.setText(f"{value}%")
-        self._volume_slider.setToolTip(
-            "Adjust preview volume." if mode_text == "Preview Vol" else "Adjust live volume."
-        )
-
-    def _on_volume_slider_changed(self, value: int) -> None:
-        percent = _coerce_volume_percent(value)
-        if self._is_preview_mode and self._can_use_preview_mode():
-            self._preview_volume_percent = percent
-        else:
-            self._live_volume_percent = percent
-        self._volume_value_label.setText(f"{percent}%")
-        self._save_volume_settings()
-        self._apply_active_volume()
-
-    def keyPressEvent(self, event: QKeyEvent | None) -> None:
-        if event is None:
-            super().keyPressEvent(event)
-            return
-
-        # Check if playback is currently active (playing or paused)
-        if self._player is None:
-            super().keyPressEvent(event)
-            return
-
-        is_playback_active = self._is_playback_active()
-
-        # Handle arrow keys for skipping during active playback
-        if is_playback_active:
-            if self._event_matches_shortcut(event, "skip_previous"):
-                self._skip_to_previous()
-                event.accept()
-                return
-            elif self._event_matches_shortcut(event, "skip_next"):
-                self._skip_to_next()
-                event.accept()
-                return
-        else:
-            # Handle arrow keys for table navigation when playback is not active
-            if self._event_matches_shortcut(event, "select_up"):
-                self._move_selection_up()
-                event.accept()
-                return
-            elif self._event_matches_shortcut(event, "select_down"):
-                self._move_selection_down()
-                event.accept()
-                return
-
-        super().keyPressEvent(event)
-
-    def _skip_to_previous(self) -> None:
-        """Skip to the previous jingle in the visible list."""
-        if not self._visible_indices:
-            self._status.showMessage("No jingles available to skip.")
-            return
-
-        current_index = self._selected_record_index()
-        if current_index is None:
-            # No selection, skip to last visible jingle
-            next_visible_index = self._visible_indices[-1]
-        else:
-            # Find current in visible list and go to previous
-            try:
-                visible_pos = self._visible_indices.index(current_index)
-                if visible_pos > 0:
-                    next_visible_index = self._visible_indices[visible_pos - 1]
-                else:
-                    # At the beginning, wrap to the end
-                    next_visible_index = self._visible_indices[-1]
-            except ValueError:
-                # Current index not in visible list, go to last visible
-                next_visible_index = self._visible_indices[-1]
-
-        record = self._records[next_visible_index]
-        if not record.path.exists():
-            self._status.showMessage("Selected file no longer exists.")
-            return
-
-        # Select the row in the table
-        visible_row = self._visible_row_for_record_index(next_visible_index)
-        if visible_row >= 0:
-            self._table.selectRow(visible_row)
-
-        # In continuous mode, continue from the manually selected jingle.
-        if self._playback_mode == "continuous":
-            try:
-                self._continuous_queue_position = self._continuous_queue.index(next_visible_index)
-            except ValueError:
-                pass
-
-        self._play_record(next_visible_index)
-        self._status.showMessage(f"Skipped to: {record.name}")
-
-    def _skip_to_next(self) -> None:
-        """Skip to the next jingle in the visible list."""
-        if not self._visible_indices:
-            self._status.showMessage("No jingles available to skip.")
-            return
-
-        current_index = self._selected_record_index()
-        if current_index is None:
-            # No selection, skip to first visible jingle
-            next_visible_index = self._visible_indices[0]
-        else:
-            # Find current in visible list and go to next
-            try:
-                visible_pos = self._visible_indices.index(current_index)
-                if visible_pos < len(self._visible_indices) - 1:
-                    next_visible_index = self._visible_indices[visible_pos + 1]
-                else:
-                    # At the end, wrap to the beginning
-                    next_visible_index = self._visible_indices[0]
-            except ValueError:
-                # Current index not in visible list, go to first visible
-                next_visible_index = self._visible_indices[0]
-
-        record = self._records[next_visible_index]
-        if not record.path.exists():
-            self._status.showMessage("Selected file no longer exists.")
-            return
-
-        # Select the row in the table
-        visible_row = self._visible_row_for_record_index(next_visible_index)
-        if visible_row >= 0:
-            self._table.selectRow(visible_row)
-
-        # In continuous mode, continue from the manually selected jingle.
-        if self._playback_mode == "continuous":
-            try:
-                self._continuous_queue_position = self._continuous_queue.index(next_visible_index)
-            except ValueError:
-                pass
-
-        self._play_record(next_visible_index)
-        self._status.showMessage(f"Skipped to: {record.name}")
-
-    def _move_selection_up(self) -> None:
-        """Move the selected row up by one (when playback is not active)."""
-        selected_ranges = self._table.selectedRanges()
-        if not selected_ranges:
-            # No selection, select the first row
-            if self._visible_indices:
-                self._table.selectRow(0)
-            return
-
-        current_row = selected_ranges[0].topRow()
-        if current_row > 0:
-            # Move up
-            self._table.selectRow(current_row - 1)
-        else:
-            # At the top, wrap to the bottom
-            if self._visible_indices:
-                self._table.selectRow(len(self._visible_indices) - 1)
-
-    def _move_selection_down(self) -> None:
-        """Move the selected row down by one (when playback is not active)."""
-        selected_ranges = self._table.selectedRanges()
-        if not selected_ranges:
-            # No selection, select the first row
-            if self._visible_indices:
-                self._table.selectRow(0)
-            return
-
-        current_row = selected_ranges[0].topRow()
-        max_row = len(self._visible_indices) - 1
-        if current_row < max_row:
-            # Move down
-            self._table.selectRow(current_row + 1)
-        else:
-            # At the bottom, wrap to the top
-            self._table.selectRow(0)
-
-    def _build_menu(self) -> None:
+    def _build_menu_bar(self) -> None:
         menu_bar = self.menuBar()
-        file_menu = menu_bar.addMenu("File")
+        assert menu_bar is not None
 
-        export_db_action = QAction("Export Tag Database...", self)
-        export_db_action.triggered.connect(self._on_file_export_tag_database)
-        file_menu.addAction(export_db_action)
-
-        import_db_action = QAction("Import Tag Database...", self)
-        import_db_action.triggered.connect(self._on_file_import_tag_database)
-        file_menu.addAction(import_db_action)
-
+        file_menu = cast(Any, menu_bar.addMenu("File"))
+        self._action_open_wav = cast(QAction, file_menu.addAction("Open WAV File..."))
+        self._action_open_wav.triggered.connect(self._on_open_wav)
+        self._action_add_wav_files = cast(QAction, file_menu.addAction("Add WAV Files..."))
+        self._action_add_wav_files.triggered.connect(self._on_add_wav_files)
         file_menu.addSeparator()
-
-        rescan_action = QAction("Rescan", self)
-        rescan_action.triggered.connect(self._rescan_library)
-        file_menu.addAction(rescan_action)
-
-        browse_action = QAction("Choose Samples Folder...", self)
-        browse_action.triggered.connect(self._on_browse_folder)
-        file_menu.addAction(browse_action)
-
+        self._action_import_playlist = cast(QAction, file_menu.addAction("Import Playlist..."))
+        self._action_import_playlist.triggered.connect(self._on_import_playlist)
+        self._action_export_playlist = cast(QAction, file_menu.addAction("Export Playlist..."))
+        self._action_export_playlist.triggered.connect(self._on_export_playlist)
         file_menu.addSeparator()
+        self._action_exit = cast(QAction, file_menu.addAction("Exit"))
+        self._action_exit.triggered.connect(self._on_exit_requested)
 
-        exit_action = QAction("Exit", self)
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
+        edit_menu = cast(Any, menu_bar.addMenu("Edit"))
+        self._action_reset = cast(QAction, edit_menu.addAction("Reset"))
+        self._action_reset.triggered.connect(self._on_reset_clicked)
+        self._action_reset_markers = cast(QAction, edit_menu.addAction("Reset Markers"))
+        self._action_reset_markers.triggered.connect(self._on_reset_markers_clicked)
+        self._action_remove_selected = cast(QAction, edit_menu.addAction("Remove Selected"))
+        self._action_remove_selected.triggered.connect(self._on_remove_selected_chapter)
 
-        edit_menu = menu_bar.addMenu("Edit")
-
-        rename_action = QAction("Rename", self)
-        rename_action.triggered.connect(self._on_edit_rename)
-        edit_menu.addAction(rename_action)
-        self._rename_action = rename_action
-
-        delete_action = QAction("Delete", self)
-        delete_action.triggered.connect(self._on_edit_delete)
-        edit_menu.addAction(delete_action)
-        self._delete_action = delete_action
-
-        edit_menu.addSeparator()
-
-        copy_to_action = QAction("Copy-To", self)
-        copy_to_action.triggered.connect(self._on_edit_copy_to)
-        edit_menu.addAction(copy_to_action)
-
-        move_to_action = QAction("Move-To", self)
-        move_to_action.triggered.connect(self._on_edit_move_to)
-        edit_menu.addAction(move_to_action)
-
-        tools_menu = menu_bar.addMenu("Tools")
-        options_action = QAction("Options", self)
-        options_action.triggered.connect(self._on_open_options)
-        tools_menu.addAction(options_action)
-        edit_shortcuts_action = QAction("Edit Keyboard Shortcuts...", self)
-        edit_shortcuts_action.triggered.connect(self._on_edit_keyboard_shortcuts)
-        tools_menu.addAction(edit_shortcuts_action)
+        tools_menu = cast(Any, menu_bar.addMenu("Tools"))
+        self._action_split_m4b = cast(
+            QAction,
+            tools_menu.addAction("Split M4B to WAV Chapters"),
+        )
+        self._action_split_m4b.triggered.connect(self._on_tools_split_m4b_chapters)
+        self._action_rename_files = cast(
+            QAction,
+            tools_menu.addAction("Rename Files From Table"),
+        )
+        self._action_rename_files.triggered.connect(self._on_tools_rename_files_from_table)
         tools_menu.addSeparator()
-        update_from_folders_action = QAction("Update Categories from Folder Titles", self)
-        update_from_folders_action.triggered.connect(self._on_tools_update_categories_from_folders)
-        tools_menu.addAction(update_from_folders_action)
-        find_duplicates_action = QAction("Find Duplicates", self)
-        find_duplicates_action.triggered.connect(self._on_tools_find_duplicates)
-        tools_menu.addAction(find_duplicates_action)
-        clear_all_categories_action = QAction("Clear All Categories", self)
-        clear_all_categories_action.triggered.connect(self._on_tools_clear_all_categories)
-        tools_menu.addAction(clear_all_categories_action)
-        tools_menu.addSeparator()
-        self._auto_folder_tags_action = QAction("Auto-tag from Folders on Scan", self)
-        self._auto_folder_tags_action.setCheckable(True)
-        self._auto_folder_tags_action.setChecked(self._auto_folder_tags)
-        self._auto_folder_tags_action.toggled.connect(self._on_auto_folder_tags_toggled)
-        tools_menu.addAction(self._auto_folder_tags_action)
+        self._action_options = cast(QAction, tools_menu.addAction("Options"))
+        self._action_options.triggered.connect(self._on_tools_options)
 
-        self._watch_library_changes_action = QAction("Auto-Refresh on Library Changes", self)
-        self._watch_library_changes_action.setCheckable(True)
-        self._watch_library_changes_action.setChecked(self._watch_library_changes)
-        self._watch_library_changes_action.toggled.connect(self._on_watch_library_changes_toggled)
-        tools_menu.addAction(self._watch_library_changes_action)
+        help_menu = cast(Any, menu_bar.addMenu("Help"))
+        self._action_about = cast(QAction, help_menu.addAction("About"))
+        self._action_about.triggered.connect(self._on_help_about)
 
-        help_menu = menu_bar.addMenu("Help")
-        about_action = QAction("About", self)
-        about_action.triggered.connect(self._on_help_about)
-        help_menu.addAction(about_action)
+        self._set_controls_enabled(True)
 
-        self._apply_keyboard_shortcuts_to_actions()
+    def _on_tools_split_m4b_chapters(self) -> None:
+        start_dir = ""
+        remembered_dir = self._settings.value("lastSplitM4bDir", "")
+        remembered_text = str(remembered_dir).strip() if remembered_dir is not None else ""
+        if remembered_text:
+            remembered_path = Path(remembered_text)
+            if remembered_path.is_dir():
+                start_dir = str(remembered_path)
 
-    def _on_help_about(self) -> None:
-        library_count = len(self._records)
-        library_duration_seconds = sum(max(0.0, record.duration_seconds) for record in self._records)
-        library_size_bytes = sum(max(0, record.size_bytes) for record in self._records)
-        runtime_dir = _runtime_app_dir()
-        revision_log_path = runtime_dir / "rev.log"
-        resolved_revision_log = revision_log_path if revision_log_path.is_file() else None
-        dialog = AboutDialog(
-            library_count=library_count,
-            library_duration_seconds=library_duration_seconds,
-            library_size_bytes=library_size_bytes,
-            revision_log_path=resolved_revision_log,
-            parent=self,
-        )
-        dialog.exec()
+        if not start_dir and self._output_dir is not None and self._output_dir.is_dir():
+            start_dir = str(self._output_dir)
 
-    def _load_keyboard_shortcuts(self) -> dict[str, str]:
-        shortcuts: dict[str, str] = dict(DEFAULT_KEYBOARD_SHORTCUTS)
-        for key, default in DEFAULT_KEYBOARD_SHORTCUTS.items():
-            value = str(self._settings.value(f"shortcuts/{key}", default)).strip()
-            if value:
-                shortcuts[key] = value
-            else:
-                shortcuts[key] = ""
-        return shortcuts
-
-    def _save_keyboard_shortcuts(self) -> None:
-        for key, default in DEFAULT_KEYBOARD_SHORTCUTS.items():
-            value = self._keyboard_shortcuts.get(key, default).strip()
-            self._settings.setValue(f"shortcuts/{key}", value)
-
-    def _shortcut_for(self, key: str) -> QKeySequence:
-        value = self._keyboard_shortcuts.get(key, "")
-        return QKeySequence(value)
-
-    def _event_matches_shortcut(self, event: QKeyEvent, key: str) -> bool:
-        seq = self._shortcut_for(key)
-        if seq.isEmpty():
-            return False
-        event_seq = QKeySequence(event.keyCombination())
-        return (
-            event_seq.toString(QKeySequence.SequenceFormat.PortableText)
-            == seq.toString(QKeySequence.SequenceFormat.PortableText)
-        )
-
-    def _apply_keyboard_shortcuts_to_actions(self) -> None:
-        if self._rename_action is not None:
-            self._rename_action.setShortcut(self._shortcut_for("rename"))
-        if self._delete_action is not None:
-            self._delete_action.setShortcut(self._shortcut_for("delete"))
-
-    def _on_edit_keyboard_shortcuts(self) -> None:
-        dialog = KeyboardShortcutsDialog(
-            current_shortcuts=self._keyboard_shortcuts,
-            default_shortcuts=DEFAULT_KEYBOARD_SHORTCUTS,
-            parent=self,
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        selected = dialog.selected_shortcuts()
-        self._keyboard_shortcuts = {
-            key: selected.get(key, DEFAULT_KEYBOARD_SHORTCUTS[key]).strip()
-            for key in DEFAULT_KEYBOARD_SHORTCUTS
-        }
-        self._save_keyboard_shortcuts()
-        self._apply_keyboard_shortcuts_to_actions()
-        self._status.showMessage("Keyboard shortcuts updated.")
-
-    def _on_file_export_tag_database(self) -> None:
-        default_name = "jingle-tags-backup.json"
-        start_dir = str(self._samples_dir) if self._samples_dir else str(Path.home())
-        start_path = str(Path(start_dir) / default_name)
-        target_str, _ = QFileDialog.getSaveFileName(
+        input_str, _ = QFileDialog.getOpenFileName(
             self,
-            "Export Tag Database",
-            start_path,
-            "JSON Files (*.json);;All Files (*)",
+            "Split M4B to WAV Chapters",
+            start_dir,
+            "Audiobook Files (*.m4b *.m4a);;All Files (*)",
         )
-        if not target_str:
+        if not input_str:
             return
 
-        target_path = Path(target_str)
-        if not target_path.suffix:
-            target_path = target_path.with_suffix(".json")
+        input_path = Path(input_str)
+        if input_path.parent.is_dir():
+            self._settings.setValue("lastSplitM4bDir", str(input_path.parent))
 
-        try:
-            self._store.export_to(target_path)
-        except OSError as exc:
-            QMessageBox.critical(
-                self,
-                "Export Failed",
-                f"Could not export tag database.\n\n{exc}",
-            )
-            self._status.showMessage("Tag database export failed.")
-            return
-
-        self._status.showMessage(f"Exported tag database to {target_path.name}")
-
-    def _on_file_import_tag_database(self) -> None:
-        source_str, _ = QFileDialog.getOpenFileName(
-            self,
-            "Import Tag Database",
-            str(self._samples_dir) if self._samples_dir else str(Path.home()),
-            "JSON Files (*.json);;All Files (*)",
-        )
-        if not source_str:
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Import Tag Database",
-            "Importing will replace the current in-memory tag database and apply it to loaded jingles.\n\n"
-            "Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            self._status.showMessage("Tag database import cancelled.")
-            return
-
-        source_path = Path(source_str)
-        try:
-            self._store.import_from(source_path)
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-            QMessageBox.critical(
-                self,
-                "Import Failed",
-                f"Could not import tag database.\n\n{exc}",
-            )
-            self._status.showMessage("Tag database import failed.")
-            return
-
-        for record in self._records:
-            record.categories = self._store.get(record.path)
-
-        self._store.save()
-        self._apply_filters()
-        self._status.showMessage(f"Imported tag database from {source_path.name}")
-
-    def _selected_single_record_index(self) -> int | None:
-        selected_indices = self._selected_record_indices()
-        if not selected_indices:
-            self._status.showMessage("Select one jingle first.")
-            return None
-        if len(selected_indices) != 1:
-            self._status.showMessage("Select exactly one jingle for this action.")
-            return None
-        return selected_indices[0]
-
-    def _validate_new_filename(self, value: str) -> str | None:
-        name = value.strip()
-        if not name:
-            return "Filename cannot be empty."
-
-        forbidden_chars = '<>:"/\\|?*'
-        if any(ch in forbidden_chars for ch in name):
-            return "Filename contains illegal characters: < > : \" / \\ | ? *"
-
-        if any(ord(ch) < 32 for ch in name):
-            return "Filename contains illegal control characters."
-
-        if name.endswith((" ", ".")):
-            return "Filename cannot end with a space or period."
-
-        stem = Path(name).stem.strip().upper()
-        if stem in {
-            "CON",
-            "PRN",
-            "AUX",
-            "NUL",
-            "COM1",
-            "COM2",
-            "COM3",
-            "COM4",
-            "COM5",
-            "COM6",
-            "COM7",
-            "COM8",
-            "COM9",
-            "LPT1",
-            "LPT2",
-            "LPT3",
-            "LPT4",
-            "LPT5",
-            "LPT6",
-            "LPT7",
-            "LPT8",
-            "LPT9",
-        }:
-            return "Filename uses a reserved Windows device name."
-
-        return None
-
-    def _on_edit_rename(self) -> None:
-        record_index = self._selected_single_record_index()
-        if record_index is None:
-            return
-
-        record = self._records[record_index]
-        source_path = record.path
-        current_name = source_path.name
-
-        while True:
-            new_name, accepted = QInputDialog.getText(
-                self,
-                "Rename Jingle",
-                "New filename:",
-                text=current_name,
-            )
-            if not accepted:
-                self._status.showMessage("Rename cancelled.")
-                return
-
-            candidate = new_name.strip()
-            if not Path(candidate).suffix:
-                candidate = f"{candidate}{source_path.suffix}"
-
-            validation_error = self._validate_new_filename(candidate)
-            if validation_error is not None:
-                QMessageBox.warning(self, "Invalid Filename", validation_error)
-                current_name = candidate
-                continue
-
-            destination_path = source_path.with_name(candidate)
-            if destination_path == source_path:
-                self._status.showMessage("Rename cancelled: filename is unchanged.")
-                return
-
-            if destination_path.exists():
-                QMessageBox.warning(
+        _is_frozen = hasattr(sys, "_MEIPASS")
+        if not _is_frozen:
+            script_path = _HERE / "split_m4b_chapters.py"
+            if not script_path.exists():
+                QMessageBox.critical(
                     self,
-                    "Filename Exists",
-                    "A file with that name already exists. Choose a different filename.",
+                    "Split Tool Missing",
+                    f"Could not find split tool script:\n{script_path}",
                 )
-                current_name = destination_path.name
-                continue
-
-            try:
-                source_path.rename(destination_path)
-            except OSError as exc:
-                QMessageBox.critical(self, "Rename Failed", f"Could not rename file.\n\n{exc}")
-                self._status.showMessage("Rename failed.")
                 return
 
-            record.path = destination_path
-            self._store.rename(source_path, destination_path)
-            self._store.save()
-            self._apply_filters()
-            self._status.showMessage(f"Renamed to {destination_path.name}")
-            return
+        output_dir = input_path.parent / f"{input_path.stem}_chapters"
 
-    def _on_edit_delete(self) -> None:
-        selected_indices = self._selected_record_indices()
-        if not selected_indices:
-            self._status.showMessage("Select one or more jingles first.")
-            return
-
-        count = len(selected_indices)
-        reply = QMessageBox.question(
-            self,
-            "Delete Jingle(s)",
-            f"Delete {count} selected file(s)? This cannot be undone.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            self._status.showMessage("Delete cancelled.")
-            return
-
-        removed_count = 0
-        failed_paths: list[Path] = []
-        for record_index in selected_indices:
-            if record_index < 0 or record_index >= len(self._records):
-                continue
-            path = self._records[record_index].path
-            try:
-                path.unlink()
-            except OSError:
-                failed_paths.append(path)
-                continue
-
-            self._store.remove(path)
-            removed_count += 1
-
-        self._store.save()
-        self._rescan_library()
-
-        if failed_paths:
-            QMessageBox.warning(
-                self,
-                "Delete Incomplete",
-                f"Deleted {removed_count} file(s), but {len(failed_paths)} could not be deleted.",
+        # Check whether output files would conflict with existing WAV files.
+        use_overwrite = False
+        if output_dir.exists() and any(output_dir.glob("*.wav")):
+            conflict_box = QMessageBox(self)
+            conflict_box.setWindowTitle("Output Files Already Exist")
+            conflict_box.setIcon(QMessageBox.Icon.Question)
+            conflict_box.setText(
+                f"The output folder already contains WAV files:\n{output_dir}\n\n"
+                "What would you like to do?"
             )
-            self._status.showMessage(
-                f"Deleted {removed_count} file(s); {len(failed_paths)} failed."
-            )
-            return
-
-        self._status.showMessage(f"Deleted {removed_count} file(s).")
-
-    def _copy_or_move_selected_jingle(self, move: bool) -> None:
-        record_index = self._selected_single_record_index()
-        if record_index is None:
-            return
-
-        record = self._records[record_index]
-        source_path = record.path
-        source_categories = list(record.categories)
-        source_ext = source_path.suffix.lower()
-        ext_label = source_ext[1:].upper() if source_ext.startswith(".") and len(source_ext) > 1 else "Source"
-        ext_pattern = f"*{source_ext}" if source_ext else "*"
-        file_filter = f"{ext_label} Files ({ext_pattern});;All Files (*)"
-
-        operation_name = "Move" if move else "Copy"
-        target_str, _ = QFileDialog.getSaveFileName(
-            self,
-            f"{operation_name} Jingle To",
-            str(source_path),
-            file_filter,
-        )
-        if not target_str:
-            self._status.showMessage(f"{operation_name} cancelled.")
-            return
-
-        destination_path = Path(target_str)
-        if destination_path.suffix == "":
-            destination_path = destination_path.with_suffix(source_path.suffix)
-
-        if destination_path == source_path:
-            self._status.showMessage(f"{operation_name} cancelled: source and destination are the same.")
-            return
-
-        if destination_path.exists():
-            overwrite = QMessageBox.question(
-                self,
-                f"{operation_name} Jingle",
-                f"{destination_path.name} already exists. Overwrite it?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if overwrite != QMessageBox.StandardButton.Yes:
-                self._status.showMessage(f"{operation_name} cancelled.")
-                return
-
-        try:
-            destination_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, destination_path)
-            try:
-                dest_stat = destination_path.stat()
-                self._store.set_media_cache(
-                    destination_path,
-                    int(dest_stat.st_size),
-                    record.duration_seconds,
-                    int(dest_stat.st_mtime_ns),
-                )
-            except OSError:
-                pass
-            self._store.set(destination_path, source_categories)
-            if move:
-                source_path.unlink()
-        except OSError as exc:
-            QMessageBox.critical(self, f"{operation_name} Failed", f"Could not {operation_name.lower()} file.\n\n{exc}")
-            self._status.showMessage(f"{operation_name} failed.")
-            return
-
-        if move:
-            self._store.remove(source_path)
-        self._store.save()
-
-        self._rescan_library()
-        self._status.showMessage(f"{operation_name} complete: {destination_path.name}")
-
-    def _on_edit_copy_to(self) -> None:
-        self._copy_or_move_selected_jingle(move=False)
-
-    def _on_edit_move_to(self) -> None:
-        self._copy_or_move_selected_jingle(move=True)
-
-    def _on_tools_clear_all_categories(self) -> None:
-        if not self._records:
-            self._status.showMessage("No jingles loaded.")
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Clear All Categories",
-            "This will remove all category tags from every loaded jingle.\n\n"
-            "Are you sure you want to continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            self._status.showMessage("Clear all categories cancelled.")
-            return
-
-        updated = 0
-        for record in self._records:
-            if record.categories:
-                record.categories = []
-                self._store.set(record.path, [])
-                updated += 1
-
-        self._store.save()
-        self._apply_filters()
-        self._status.showMessage(f"Cleared categories for {updated} jingle(s).")
-
-    def _on_auto_folder_tags_toggled(self, checked: bool) -> None:
-        self._auto_folder_tags = checked
-        self._save_auto_folder_tags()
-        state = "enabled" if checked else "disabled"
-        self._status.showMessage(f"Auto-tag from folders on scan: {state}.")
-
-    def _on_watch_library_changes_toggled(self, checked: bool) -> None:
-        self._watch_library_changes = checked
-        self._save_watch_library_changes()
-
-        if not checked:
-            self._watch_rescan_timer.stop()
-            self._library_watcher.removePaths(self._library_watcher.directories())
-            self._library_watcher.removePaths(self._library_watcher.files())
-            self._status.showMessage("Auto-refresh on library changes: disabled.")
-            return
-
-        self._refresh_library_watcher_paths([record.path for record in self._records])
-        self._status.showMessage("Auto-refresh on library changes: enabled.")
-
-    def _on_tools_update_categories_from_folders(self) -> None:
-        if not self._records:
-            self._status.showMessage("No jingles loaded.")
-            return
-
-        preserve_existing = self._prompt_folder_update_mode()
-        if preserve_existing is None:
-            self._status.showMessage("Folder-derived category update cancelled.")
-            return
-
-        updated = self._apply_folder_titles_to_records(self._records, preserve_existing)
-        mode_text = "preserved" if preserve_existing else "overwritten"
-        self._status.showMessage(
-            f"Updated categories from folder titles for {updated} jingle(s); existing tags {mode_text}."
-        )
-
-    def _duplicate_format_sort_key(self, path: Path) -> tuple[int, str, str]:
-        suffix = path.suffix.lower()
-        return (
-            DUPLICATE_FORMAT_PRIORITY.get(suffix, 99),
-            suffix,
-            path.name.casefold(),
-        )
-
-    def _find_duplicate_audio_variants(self) -> list[list[Path]]:
-        if self._samples_dir is None:
-            return []
-
-        grouped: dict[tuple[str, str], list[Path]] = {}
-        for path in self._scan_audio_files(self._samples_dir):
-            key = (str(path.parent).casefold(), path.stem.casefold())
-            grouped.setdefault(key, []).append(path)
-
-        duplicates: list[list[Path]] = []
-        for variants in grouped.values():
-            suffixes = {path.suffix.lower() for path in variants}
-            if len(variants) < 2 or len(suffixes) < 2:
-                continue
-
-            ordered = sorted(variants, key=self._duplicate_format_sort_key)
-            duplicates.append(ordered)
-
-        return duplicates
-
-    def _prompt_duplicate_resolution_mode(self, duplicate_count: int, removal_count: int, sample_paths: list[Path]) -> str | None:
-        sample_keep = sample_paths[0]
-        sample_remove = sample_paths[1:]
-        sample_text = (
-            f"\n\nExample:\nKeep: {sample_keep.name}\nRemove: "
-            + ", ".join(path.name for path in sample_remove[:3])
-        )
-
-        box = QMessageBox(self)
-        box.setWindowTitle("Find Duplicates")
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setText(
-            f"Found {duplicate_count} duplicate jingle name group(s) across multiple audio formats.\n\n"
-            f"Automatic mode will remove {removal_count} lower-priority file(s), preferring WAV when available."
-            f"{sample_text}\n\nHow would you like to resolve duplicates?"
-        )
-        auto_button = box.addButton("Automatic", QMessageBox.ButtonRole.AcceptRole)
-        manual_button = box.addButton("Ask Me Each Time", QMessageBox.ButtonRole.ActionRole)
-        cancel_button = box.addButton(QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(auto_button)
-        box.exec()
-
-        clicked = box.clickedButton()
-        if clicked is auto_button:
-            return "auto"
-        if clicked is manual_button:
-            return "manual"
-        if clicked is cancel_button:
-            return None
-        return None
-
-    def _prompt_duplicate_keep_choice(self, variants: list[Path]) -> Path | None:
-        folder_name = variants[0].parent.name or str(variants[0].parent)
-        items = [path.name for path in variants]
-        choice, accepted = QInputDialog.getItem(
-            self,
-            "Find Duplicates",
-            "Choose which file to keep:\n\n"
-            f"Folder: {folder_name}\n"
-            f"Jingle: {variants[0].stem}",
-            items,
-            0,
-            False,
-        )
-        if not accepted:
-            return None
-        for path in variants:
-            if path.name == choice:
-                return path
-        return None
-
-    def _build_duplicate_removal_plan(
-        self, duplicates: list[list[Path]], resolution_mode: str
-    ) -> list[tuple[Path, list[Path]]] | None:
-        removal_plan: list[tuple[Path, list[Path]]] = []
-        for variants in duplicates:
-            keep_path = variants[0]
-            if resolution_mode == "manual":
-                selected_keep = self._prompt_duplicate_keep_choice(variants)
-                if selected_keep is None:
-                    return None
-                keep_path = selected_keep
-            remove_paths = [path for path in variants if path != keep_path]
-            if remove_paths:
-                removal_plan.append((keep_path, remove_paths))
-        return removal_plan
-
-    def _on_tools_find_duplicates(self) -> None:
-        if self._samples_dir is None:
-            self._status.showMessage("Choose a samples folder first.")
-            return
-
-        if (
-            self._player is not None
-            and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-        ):
-            self._status.showMessage("Stop playback before running Find Duplicates.")
-            return
-
-        duplicates = self._find_duplicate_audio_variants()
-        if not duplicates:
-            self._status.showMessage("No duplicate audio-format variants were found.")
-            return
-
-        automatic_removal_count = sum(max(0, len(variants) - 1) for variants in duplicates)
-        resolution_mode = self._prompt_duplicate_resolution_mode(
-            len(duplicates),
-            automatic_removal_count,
-            duplicates[0],
-        )
-        if resolution_mode is None:
-            self._status.showMessage("Find Duplicates cancelled.")
-            return
-
-        removal_plan = self._build_duplicate_removal_plan(duplicates, resolution_mode)
-        if removal_plan is None:
-            self._status.showMessage("Find Duplicates cancelled.")
-            return
-
-        removed_count = 0
-        failed_paths: list[Path] = []
-        for _keep_path, remove_paths in removal_plan:
-            for path in remove_paths:
-                try:
-                    path.unlink()
-                    removed_count += 1
-                except OSError:
-                    failed_paths.append(path)
-
-        if removed_count > 0:
-            self._rescan_library()
-
-        if failed_paths:
-            failed_count = len(failed_paths)
-            QMessageBox.warning(
-                self,
-                "Find Duplicates",
-                f"Removed {removed_count} duplicate file(s), but {failed_count} could not be deleted.",
-            )
-            self._status.showMessage(
-                f"Removed {removed_count} duplicate file(s); {failed_count} failed to delete."
-            )
-            return
-
-        if removed_count > 0:
-            self._status.showMessage(f"Removed {removed_count} duplicate file(s).")
-        else:
-            self._status.showMessage("No duplicate files were removed.")
-
-    def _on_update_selected_from_folders_clicked(self) -> None:
-        selected_rows = sorted({idx.row() for idx in self._table.selectedIndexes()})
-        if not selected_rows:
-            self._status.showMessage("Select one or more rows first.")
-            return
-
-        selected_records: list[JingleRecord] = []
-        seen: set[int] = set()
-        for row in selected_rows:
-            if row < 0 or row >= len(self._visible_indices):
-                continue
-            record_index = self._visible_indices[row]
-            if record_index in seen:
-                continue
-            seen.add(record_index)
-            selected_records.append(self._records[record_index])
-
-        if not selected_records:
-            self._status.showMessage("No valid selected rows found.")
-            return
-
-        preserve_existing = self._prompt_folder_update_mode()
-        if preserve_existing is None:
-            self._status.showMessage("Selected folder-derived category update cancelled.")
-            return
-
-        updated = self._apply_folder_titles_to_records(selected_records, preserve_existing)
-        mode_text = "preserved" if preserve_existing else "overwritten"
-        self._status.showMessage(
-            f"Updated selected rows from folder titles for {updated} jingle(s); existing tags {mode_text}."
-        )
-
-    def _prompt_folder_update_mode(self) -> bool | None:
-        """Return True=preserve, False=overwrite, None=cancel."""
-        prompt = QMessageBox(self)
-        prompt.setWindowTitle("Update Categories from Folder Titles")
-        prompt.setIcon(QMessageBox.Icon.Question)
-        prompt.setText(
-            "How should folder-derived tags be applied?\n\n"
-            "Folder tags are derived from the path under your selected Samples folder."
-        )
-        preserve_btn = prompt.addButton("Preserve Existing Tags", QMessageBox.ButtonRole.AcceptRole)
-        overwrite_btn = prompt.addButton("Overwrite Tags", QMessageBox.ButtonRole.DestructiveRole)
-        cancel_btn = prompt.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        prompt.setDefaultButton(preserve_btn)
-        prompt.exec()
-
-        clicked = prompt.clickedButton()
-        if clicked is preserve_btn:
-            return True
-        if clicked is overwrite_btn:
-            return False
-        if clicked is cancel_btn:
-            return None
-        return None
-
-    def _derive_folder_tags(self, record: JingleRecord) -> list[str]:
-        """Derive folder tags under sample root, excluding the sample root itself."""
-        if self._samples_dir is None:
-            return []
-        try:
-            rel_parent = record.path.relative_to(self._samples_dir).parent
-            return [part.strip() for part in rel_parent.parts if part.strip()]
-        except ValueError:
-            # If the file is outside selected root unexpectedly, skip derivation.
-            return []
-
-    def _apply_folder_titles_to_records(
-        self,
-        records: list[JingleRecord],
-        preserve_existing: bool,
-    ) -> int:
-        updated = 0
-        for record in records:
-            derived_tags = self._derive_folder_tags(record)
-            if preserve_existing:
-                new_categories = _merge_tags(record.categories, derived_tags)
+            overwrite_btn = conflict_box.addButton("Overwrite", QMessageBox.ButtonRole.DestructiveRole)
+            unique_btn = conflict_box.addButton("Use Unique Names", QMessageBox.ButtonRole.AcceptRole)
+            conflict_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            conflict_box.setDefaultButton(unique_btn)
+            conflict_box.exec()
+            clicked = conflict_box.clickedButton()
+            if clicked is overwrite_btn:
+                use_overwrite = True
+            elif clicked is unique_btn:
+                use_overwrite = False
             else:
-                new_categories = _normalize_tags(derived_tags)
+                return
 
-            if new_categories != record.categories:
-                record.categories = new_categories
-                self._store.set(record.path, new_categories)
-                updated += 1
+        self._status.showMessage("Splitting M4B into WAV chapters\u2026")
 
-        self._store.save()
-        self._apply_filters()
-        return updated
-
-    def _connect_player_signals(self) -> None:
-        if self._player is None:
-            self._play_btn.setEnabled(False)
-            self._stop_btn.setEnabled(False)
-            self._mute_btn.setEnabled(False)
-            self._loop_btn.setEnabled(False)
-            self._mode_btn.setEnabled(False)
-            self._volume_slider.setEnabled(False)
-            self._set_loop_breathing(False)
-            self._status.showMessage("PyQt6 multimedia is not available. Playback is disabled.")
-            return
-
-        self._player.durationChanged.connect(self._on_duration_changed)
-        self._player.positionChanged.connect(self._on_position_changed)
-        self._player.playbackStateChanged.connect(self._on_playback_state_changed)
-        self._player.mediaStatusChanged.connect(self._on_media_status_changed)
-        self._apply_player_loop_mode()
-
-    def _create_settings_store(self) -> QSettings:
-        settings_path = self._app_data_dir / "settings.ini"
-        settings = QSettings(str(settings_path), QSettings.Format.IniFormat)
-        settings.setFallbacksEnabled(False)
-        return settings
-
-    def _load_samples_dir(self) -> Path | None:
-        raw = str(self._settings.value("library/samplesDir", "")).strip()
-        if raw:
-            candidate = Path(raw)
-            if candidate.exists() and candidate.is_dir():
-                return candidate
-        return None
-
-    def _save_samples_dir(self) -> None:
-        if self._samples_dir is not None:
-            self._settings.setValue("library/samplesDir", str(self._samples_dir))
-
-    def _load_auto_folder_tags(self) -> bool:
-        return str(self._settings.value("library/autoFolderTags", "")).strip().lower() == "true"
-
-    def _save_auto_folder_tags(self) -> None:
-        self._settings.setValue("library/autoFolderTags", "true" if self._auto_folder_tags else "false")
-
-    def _load_watch_library_changes(self) -> bool:
-        raw = str(self._settings.value("library/watchLibraryChanges", "true")).strip().lower()
-        return raw != "false"
-
-    def _save_watch_library_changes(self) -> None:
-        self._settings.setValue(
-            "library/watchLibraryChanges",
-            "true" if self._watch_library_changes else "false",
-        )
-
-    def _maybe_run_first_time_setup(self) -> None:
-        is_first_run = str(self._settings.value("library/samplesDir", "")).strip() == ""
-        if is_first_run:
-            self._run_first_time_setup()
+        if _is_frozen:
+            cmd_args = [
+                "--split-worker",
+                str(input_path),
+                "--output-dir",
+                str(output_dir),
+            ]
         else:
-            loaded_count = self._load_cached_records_for_selected_root()
-            if loaded_count > 0:
-                self._status.showMessage(
-                    f"Loaded {loaded_count} jingles from cache. Checking for library changes..."
-                )
-            QTimer.singleShot(0, self._rescan_library)
+            cmd_args = [
+                str(script_path),
+                str(input_path),
+                "--output-dir",
+                str(output_dir),
+            ]
+        if use_overwrite:
+            cmd_args.append("--overwrite")
 
-    def _run_first_time_setup(self) -> None:
-        QMessageBox.information(
-            self,
-            "Welcome to JingleAllTheDay",
-            "Let's get started.\n\nFirst, select the folder where your jingles and audio samples are stored.",
-        )
+        self._split_cancelled = False
+        self._split_output_lines = []
+        self._split_output_files = []
+        self._split_output_buffer = ""
+        self._split_output_dir = output_dir
 
-        selected = QFileDialog.getExistingDirectory(
-            self,
-            "Choose Samples / Jingles Folder",
-            str(Path.home()),
+        process = QProcess(self)
+        process.setProgram(sys.executable)
+        process.setArguments(cmd_args)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        process.readyReadStandardOutput.connect(self._on_split_stdout_ready)
+        process.finished.connect(self._on_split_process_finished)
+        self._split_process = process
+
+        self._set_controls_enabled(False)
+        self._set_encode_btn_state("cancel_split")
+        self._encode_btn.setEnabled(True)
+
+        process.start()
+
+    def _handle_split_output_line(self, line: str) -> None:
+        if not line:
+            return
+        self._split_output_lines.append(line)
+
+        if line.startswith("[") and "] Converting:" in line:
+            self._status.showMessage(f"Splitting\u2026 {line}")
+            output_dir = self._split_output_dir
+            if output_dir is not None:
+                _, _, out_part = line.partition(" -> ")
+                out_name = out_part.strip()
+                if out_name:
+                    self._split_output_files.append(output_dir / out_name)
+        elif line.startswith("Done. Created "):
+            self._status.showMessage(line)
+        elif line.startswith("Found ") and " chapters in:" in line:
+            self._status.showMessage(line)
+
+    def _on_split_stdout_ready(self) -> None:
+        if self._split_process is None:
+            return
+        chunk = self._split_process.readAllStandardOutput().data().decode(
+            "utf-8", errors="replace"
         )
-        if not selected:
-            QMessageBox.information(
+        if not chunk:
+            return
+
+        self._split_output_buffer += chunk
+        while "\n" in self._split_output_buffer:
+            raw_line, self._split_output_buffer = self._split_output_buffer.split("\n", 1)
+            self._handle_split_output_line(raw_line.strip())
+
+    def _on_split_process_finished(
+        self, exit_code: int, _exit_status: QProcess.ExitStatus
+    ) -> None:
+        if self._split_output_buffer.strip():
+            self._handle_split_output_line(self._split_output_buffer.strip())
+        self._split_output_buffer = ""
+
+        output_dir = self._split_output_dir
+        output_lines = list(self._split_output_lines)
+        split_output_files = list(self._split_output_files)
+
+        self._split_output_lines.clear()
+        self._split_output_files.clear()
+        self._split_output_dir = None
+
+        process = self._split_process
+        self._split_process = None
+        if process is not None:
+            process.deleteLater()
+
+        self._set_controls_enabled(True)
+        self._set_encode_btn_state("encode")
+        self._encode_btn.setEnabled(self._wav_path is not None or bool(self._source_files))
+
+        if self._split_cancelled:
+            cancel_status = self._prompt_split_cancel_cleanup(output_dir, split_output_files)
+            self._status.showMessage(cancel_status)
+            return
+
+        if exit_code != 0:
+            details = ("\n".join(output_lines[-8:]) or "Unknown error").strip()
+            self._status.showMessage("Split M4B failed.")
+            QMessageBox.critical(
                 self,
-                "Setup Cancelled",
-                "No folder was selected. The application will now close.\n\n"
-                "You will be prompted again on next launch.",
+                "Split M4B Failed",
+                f"Could not split audiobook.\n\n{details}",
             )
-            QApplication.quit()
             return
 
-        path = Path(selected)
-        if not path.exists() or not path.is_dir():
-            QMessageBox.warning(self, "Invalid Folder", "The selected path is not a valid folder. The application will now close.")
-            QApplication.quit()
+        if output_dir is None:
+            self._status.showMessage("Split complete.")
             return
 
-        self._samples_dir = path
-        self._save_samples_dir()
+        self._status.showMessage(f"Split complete \u2014 {output_dir}")
 
-        reply = QMessageBox.question(
+        # Use the exact files referenced by this split run, preserving order.
+        files_to_add: list[Path] = []
+        seen: set[Path] = set()
+        for path in split_output_files:
+            if path in seen:
+                continue
+            seen.add(path)
+            if path.exists() and path.is_file():
+                files_to_add.append(path)
+
+        if not files_to_add:
+            return
+
+        add_reply = QMessageBox.question(
             self,
-            "Auto-tag from Folders?",
-            "Would you like to automatically assign tags to jingles based on their folder names?\n\n"
-            "For example, a file in Samples/Holiday/Christmas/ would receive the tags \"Holiday\" and \"Christmas\".\n\n"
-            "You can change this later via Tools > Options.",
+            "Add Split Files",
+            f"Split completed with {len(files_to_add)} WAV file(s).\n\n"
+            "Would you like to add them to the chapter listing?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
-        self._auto_folder_tags = reply == QMessageBox.StandardButton.Yes
-        self._save_auto_folder_tags()
+        if add_reply == QMessageBox.StandardButton.Yes:
+            self._add_chapters_from_files(files_to_add)
 
-        self._rescan_library()
+    def _prompt_split_cancel_cleanup(
+        self,
+        output_dir: Path | None,
+        split_output_files: list[Path],
+    ) -> str:
+        if output_dir is None:
+            return "Split cancelled."
 
-    def _scan_audio_files(self, root: Path) -> list[Path]:
-        files: list[Path] = []
-        if not root.exists() or not root.is_dir():
-            return files
-        for path in root.rglob("*"):
-            if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
-                files.append(path)
-
-        files.sort(key=self._file_sort_key)
-        return files
-
-    def _file_sort_key(self, path: Path) -> tuple[int, str, str, str, str]:
-        root = self._samples_dir
-        try:
-            if root is not None:
-                rel_parent = path.relative_to(root).parent
-                parent_depth = len(rel_parent.parts)
-                rel_parent_text = str(rel_parent).lower()
-            else:
-                raise ValueError
-        except ValueError:
-            parent_depth = 999
-            rel_parent_text = str(path.parent).lower()
-
-        folder_block = path.parent.name.lower()
-        filename = path.stem.lower()
-        full_path = str(path).lower()
-        return (parent_depth, folder_block, rel_parent_text, filename, full_path)
-
-    def _load_cached_records_for_selected_root(self) -> int:
-        if self._samples_dir is None:
-            return 0
-
-        records: list[JingleRecord] = []
-        for path_key, _info in self._store.iter_entries():
-            path = Path(path_key)
-            try:
-                path.relative_to(self._samples_dir)
-            except ValueError:
+        existing_created_files: list[Path] = []
+        seen: set[Path] = set()
+        for path in split_output_files:
+            if path in seen:
                 continue
+            seen.add(path)
+            if path.exists() and path.is_file():
+                existing_created_files.append(path)
 
-            if path.suffix.lower() not in AUDIO_EXTENSIONS:
-                continue
+        created_count = len(existing_created_files)
+        if not existing_created_files:
+            return "Split cancelled. No created files were found."
 
-            categories = self._store.get(path)
-            media_cache = self._store.get_media_cache(path)
-            if media_cache is None:
-                size_bytes = 0
-                duration_seconds = 0.0
-            else:
-                size_bytes, duration_seconds, _mtime_ns = media_cache
+        prompt = QMessageBox(self)
+        prompt.setWindowTitle("Split Cancelled")
+        prompt.setIcon(QMessageBox.Icon.Question)
+        prompt.setText(
+            f"Split was cancelled and {len(existing_created_files)} WAV file(s) were created.\n\n"
+            "What would you like to do with them?"
+        )
+        delete_folder_btn = prompt.addButton(
+            "Delete Folder and All Files", QMessageBox.ButtonRole.DestructiveRole
+        )
+        delete_created_btn = prompt.addButton(
+            "Delete Created Files Only", QMessageBox.ButtonRole.AcceptRole
+        )
+        do_nothing_btn = prompt.addButton("Do Nothing", QMessageBox.ButtonRole.RejectRole)
+        prompt.setDefaultButton(cast(QPushButton, do_nothing_btn))
+        prompt.exec()
 
-            records.append(
-                JingleRecord(
-                    path=path,
-                    categories=categories,
-                    size_bytes=size_bytes,
-                    duration_seconds=duration_seconds,
-                )
-            )
+        clicked = prompt.clickedButton()
+        if clicked is do_nothing_btn:
+            return f"Split cancelled. {created_count} created file(s) were kept."
 
-        records.sort(key=lambda record: self._file_sort_key(record.path))
-        self._records = records
-        self._apply_filters()
-        return len(records)
-
-    def _refresh_library_watcher_paths(self, files: list[Path]) -> None:
-        if self._samples_dir is None or not self._watch_library_changes:
-            self._library_watcher.removePaths(self._library_watcher.directories())
-            self._library_watcher.removePaths(self._library_watcher.files())
-            return
-
-        watch_dirs: set[str] = {str(self._samples_dir)}
-        for path in files:
-            watch_dirs.add(str(path.parent))
-
-        current_dirs = set(self._library_watcher.directories())
-        remove_dirs = sorted(current_dirs - watch_dirs)
-        add_dirs = sorted(watch_dirs - current_dirs)
-
-        if remove_dirs:
-            self._library_watcher.removePaths(remove_dirs)
-        if add_dirs:
-            self._library_watcher.addPaths(add_dirs)
-
-    def _on_library_watch_path_changed(self, _path: str) -> None:
-        if self._samples_dir is None or not self._watch_library_changes:
-            return
-        # Coalesce bursty filesystem events into one incremental reconcile pass.
-        self._watch_rescan_timer.start(700)
-
-    def _on_library_watch_rescan_timeout(self) -> None:
-        if self._samples_dir is None or self._is_rescanning:
-            return
-        self._status.showMessage("Library changes detected. Refreshing...")
-        self._rescan_library()
-
-    def _rescan_library(self) -> None:
-        if self._samples_dir is None:
-            self._refresh_library_watcher_paths([])
-            self._records = []
-            self._apply_filters()
-            return
-        if self._is_rescanning:
-            return
-        self._is_rescanning = True
-        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
-        try:
-            files = self._scan_audio_files(self._samples_dir)
-            self._refresh_library_watcher_paths(files)
-            self._store.sync_with_files(files)
-
-            records: list[JingleRecord] = []
-            changed_count = 0
-            for path in files:
-                categories = self._store.get(path)
+        errors: list[str] = []
+        if clicked is delete_folder_btn:
+            if output_dir.exists() and output_dir.is_dir():
                 try:
-                    stat = path.stat()
-                    size_bytes = int(stat.st_size)
-                    mtime_ns = int(stat.st_mtime_ns)
-                except OSError:
-                    size_bytes = 0
-                    mtime_ns = 0
-
-                cached = self._store.get_media_cache(path)
-                if (
-                    cached is not None
-                    and cached[0] == size_bytes
-                    and cached[2] == mtime_ns
-                ):
-                    duration_seconds = cached[1]
-                else:
-                    duration_seconds = _probe_duration_seconds(path)
-                    changed_count += 1
-                self._store.set_media_cache(path, size_bytes, duration_seconds, mtime_ns)
-
-                records.append(
-                    JingleRecord(
-                        path=path,
-                        categories=categories,
-                        size_bytes=size_bytes,
-                        duration_seconds=duration_seconds,
+                    shutil.rmtree(output_dir)
+                    return (
+                        "Split cancelled. "
+                        f"{created_count} created file(s) were deleted by removing the folder."
                     )
+                except OSError as exc:
+                    errors.append(str(exc))
+            else:
+                return "Split cancelled. Output folder no longer exists."
+        elif clicked is delete_created_btn:
+            deleted = 0
+            for path in existing_created_files:
+                try:
+                    path.unlink(missing_ok=True)
+                    deleted += 1
+                except OSError as exc:
+                    errors.append(f"{path.name}: {exc}")
+            if not errors:
+                return f"Split cancelled. {deleted} created file(s) were deleted."
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Cleanup Incomplete",
+                "Some items could not be removed.\n\n" + "\n".join(errors[:8]),
+            )
+            if clicked is delete_created_btn:
+                deleted_count = created_count - len(errors)
+                return (
+                    "Split cancelled. "
+                    f"{deleted_count}/{created_count} created file(s) were deleted; "
+                    f"{len(errors)} could not be removed."
                 )
+            return "Split cancelled. Folder cleanup was incomplete due to file errors."
 
-            self._records = records
-            self._store.save()
+        return "Split cancelled."
 
-            if self._auto_folder_tags:
-                self._apply_folder_titles_to_records(self._records, preserve_existing=True)
+    def _on_help_about(self) -> None:
+        dialog = AboutDialog(self)
+        dialog.exec()
 
-            self._apply_filters()
-            self._status.showMessage(
-                f"Rescan complete: {len(records)} jingles ({changed_count} changed/new files re-probed)."
-            )
-        finally:
-            QApplication.restoreOverrideCursor()
-            self._is_rescanning = False
-
-    def _apply_filters(self) -> None:
-        query = self._search_edit.text().strip().casefold()
-        scope_data = self._search_scope_combo.currentData()
-        search_scope = str(scope_data) if scope_data is not None else "all"
-        selected_categories = _normalize_tags(self._category_filter_edit.text())
-        mode_data = self._category_filter_mode.currentData()
-        category_mode = str(mode_data) if mode_data is not None else "any"
-        self._refresh_filter_chips(selected_categories)
-
-        visible: list[int] = []
-        for index, record in enumerate(self._records):
-            if selected_categories:
-                record_keys = {tag.casefold() for tag in record.categories}
-                selected_keys = {tag.casefold() for tag in selected_categories}
-                if category_mode == "all":
-                    if not selected_keys.issubset(record_keys):
-                        continue
-                else:
-                    if record_keys.isdisjoint(selected_keys):
-                        continue
-
-            if query:
-                if search_scope == "name":
-                    haystack = record.name.casefold()
-                elif search_scope == "tag":
-                    haystack = _tags_to_text(record.categories).casefold()
-                elif search_scope == "path":
-                    haystack = str(record.path).casefold()
-                else:
-                    haystack = " ".join(
-                        [
-                            record.name,
-                            _tags_to_text(record.categories),
-                            str(record.path),
-                        ]
-                    ).casefold()
-                if query not in haystack:
-                    continue
-
-            visible.append(index)
-
-        self._visible_indices = visible
-        self._rebuild_table()
-        self._refresh_status_summary()
-
-    def _selected_record_indices(self) -> list[int]:
-        selected_rows = sorted({idx.row() for idx in self._table.selectedIndexes()})
-        selected_record_indices: list[int] = []
-        seen: set[int] = set()
-        for row in selected_rows:
-            if row < 0 or row >= len(self._visible_indices):
-                continue
-            record_index = self._visible_indices[row]
-            if record_index in seen:
-                continue
-            seen.add(record_index)
-            selected_record_indices.append(record_index)
-        return selected_record_indices
-
-    def _refresh_status_summary(self) -> None:
-        total_count = len(self._records)
-        shown_count = len(self._visible_indices)
-        shown_bytes = sum(self._records[i].size_bytes for i in self._visible_indices)
-        shown_seconds = sum(self._records[i].duration_seconds for i in self._visible_indices)
-
-        message = (
-            f"Showing {shown_count} of {total_count} jingles - "
-            f"({_format_size_label(shown_bytes)}, {_format_duration_hms(shown_seconds)})"
-        )
-
-        selected_indices = self._selected_record_indices()
-        selected_count = len(selected_indices)
-        if selected_count > 0:
-            selected_bytes = sum(self._records[i].size_bytes for i in selected_indices)
-            selected_seconds = sum(self._records[i].duration_seconds for i in selected_indices)
-            message += (
-                f" | Selected {selected_count} "
-                f"- ({_format_size_label(selected_bytes)}, {_format_duration_hms(selected_seconds)})"
-            )
-
-        self._status.showMessage(message)
-
-    def _refresh_filter_chips(self, selected_categories: list[str]) -> None:
-        self._clear_filters_btn.setEnabled(bool(selected_categories))
-
-        while self._chips_layout.count():
-            item = self._chips_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-
-        if not selected_categories:
-            empty = QLabel("None")
-            empty.setStyleSheet("color: #888;")
-            self._chips_layout.addWidget(empty)
-            self._chips_layout.addStretch()
+    def _on_tools_rename_files_from_table(self) -> None:
+        """Rename each source WAV file to match its Title column entry."""
+        if not self._source_files:
+            self._status.showMessage("No individual WAV files to rename.")
             return
 
-        for tag in selected_categories:
-            btn = QPushButton(f"{tag}  x")
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            # Keep chip color stable while typing by seeding on the first character.
-            seed = tag.strip()[:1] or "_"
-            bg, border, hover = _chip_palette_for_tag_seed(seed)
-            btn.setStyleSheet(
-                "QPushButton {"
-                f" border: 1px solid {border};"
-                " border-radius: 10px;"
-                " padding: 3px 8px;"
-                f" background: {bg};"
-                " color: #ffffff;"
-                "}"
-                f"QPushButton:hover {{ background: {hover}; }}"
-            )
-            btn.clicked.connect(lambda _checked=False, t=tag: self._remove_filter_tag(t))
-            self._chips_layout.addWidget(btn)
-
-        self._chips_layout.addStretch()
-
-    def _remove_filter_tag(self, tag_to_remove: str) -> None:
-        current = _normalize_tags(self._category_filter_edit.text())
-        keep = [tag for tag in current if tag.casefold() != tag_to_remove.casefold()]
-        self._category_filter_edit.setText(_tags_to_text(keep))
-
-    def _clear_all_filter_tags(self) -> None:
-        self._search_edit.clear()
-        self._category_filter_edit.clear()
-
-    def _on_search_scope_changed(self) -> None:
-        scope_data = self._search_scope_combo.currentData()
-        scope = str(scope_data) if scope_data is not None else "all"
-        if scope == "name":
-            self._search_edit.setPlaceholderText("Search by jingle name")
-        elif scope == "tag":
-            self._search_edit.setPlaceholderText("Search by tags")
-        elif scope == "path":
-            self._search_edit.setPlaceholderText("Search by path")
-        else:
-            self._search_edit.setPlaceholderText("Search by jingle name, tags, or path")
-        self._apply_filters()
-
-    def _rebuild_table(self) -> None:
-        self._updating_table = True
-        self._table.blockSignals(True)
-        self._table.setRowCount(len(self._visible_indices))
-
-        for row, record_index in enumerate(self._visible_indices):
-            record = self._records[record_index]
-            jingle_item = QTableWidgetItem(record.name)
-            jingle_item.setFlags(jingle_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            jingle_item.setData(Qt.ItemDataRole.UserRole, record_index)
-
-            category_item = QTableWidgetItem(_tags_to_text(record.categories))
-            category_item.setToolTip("Comma or semicolon separated tags")
-            category_item.setData(Qt.ItemDataRole.UserRole, record_index)
-
-            folder_item = QTableWidgetItem(record.folder)
-            folder_item.setFlags(folder_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            folder_item.setData(Qt.ItemDataRole.UserRole, record_index)
-            folder_item.setToolTip(str(record.path))
-
-            self._table.setItem(row, 0, jingle_item)
-            self._table.setItem(row, 1, category_item)
-            self._table.setItem(row, 2, folder_item)
-
-        self._table.blockSignals(False)
-        self._updating_table = False
-        self._table.resizeColumnToContents(1)
-        self._table.resizeColumnToContents(2)
-
-    def _on_table_item_changed(self, item: QTableWidgetItem) -> None:
-        if self._updating_table:
-            return
-
-        col = item.column()
-        if col != 1:
-            return
-
-        record_index = item.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(record_index, int):
-            return
-        if record_index < 0 or record_index >= len(self._records):
-            return
-
-        record = self._records[record_index]
-        new_categories = _normalize_tags(self._table.item(item.row(), 1).text())
-
-        record.categories = new_categories
-        self._store.set(record.path, new_categories)
-        self._store.save()
-
-        self._apply_filters()
-
-    def _on_apply_bulk_to_selected(self) -> None:
-        selected_rows = sorted({idx.row() for idx in self._table.selectedIndexes()})
-        if not selected_rows:
-            self._status.showMessage("Select one or more rows first.")
-            return
-
-        categories = _normalize_tags(self._bulk_category_edit.text())
-        mode_data = self._bulk_mode_combo.currentData()
-        mode = str(mode_data) if mode_data is not None else "replace"
-
-        if mode in {"append", "remove"} and not categories:
-            verb = "append" if mode == "append" else "remove"
-            self._status.showMessage(f"Enter one or more tags to {verb}.")
-            return
-
-        updated = 0
-        for row in selected_rows:
-            if row < 0 or row >= len(self._visible_indices):
-                continue
-            record_index = self._visible_indices[row]
-            record = self._records[record_index]
-
-            if mode == "append":
-                new_categories = _merge_tags(record.categories, categories)
-            elif mode == "remove":
-                new_categories = _remove_tags(record.categories, categories)
-            else:
-                new_categories = list(categories)
-
-            record.categories = new_categories
-            self._store.set(record.path, new_categories)
-            updated += 1
-
-        self._store.save()
-        self._apply_filters()
-        action_text = {
-            "append": "Appended",
-            "remove": "Removed",
-            "replace": "Updated",
-        }.get(mode, "Updated")
-        self._status.showMessage(f"{action_text} tags for {updated} jingle(s).")
-
-    def _selected_record(self) -> JingleRecord | None:
-        selected = self._table.selectedRanges()
-        if not selected:
-            return None
-        row = selected[0].topRow()
-        if row < 0 or row >= len(self._visible_indices):
-            return None
-        return self._records[self._visible_indices[row]]
-
-    def _on_table_context_menu_requested(self, pos: Any) -> None:
-        row = self._table.rowAt(pos.y())
-        if row >= 0:
-            clicked_item = self._table.item(row, 0)
-            if clicked_item is not None and not clicked_item.isSelected():
-                self._table.selectRow(row)
-
-        selected_count = len(self._selected_record_indices())
-
-        menu = QMenu(self)
-        rename_action = menu.addAction("Rename")
-        rename_action.setEnabled(selected_count == 1)
-        rename_action.triggered.connect(self._on_edit_rename)
-
-        delete_action = menu.addAction("Delete")
-        delete_action.setEnabled(selected_count > 0)
-        delete_action.triggered.connect(self._on_edit_delete)
-
-        menu.exec(self._table.viewport().mapToGlobal(pos))
-
-    def _on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
-        if item.column() != 0:
-            return
-        self._table.selectRow(item.row())
-        if (
-            self._player is not None
-            and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-        ):
-            self._player.stop()
-            self._reset_continuous_queue()
-            self._current_playing_name = ""
-        self._on_play_clicked()
-
-    def _selected_record_index(self) -> int | None:
-        selected = self._table.selectedRanges()
-        if not selected:
-            return None
-        row = selected[0].topRow()
-        if row < 0 or row >= len(self._visible_indices):
-            return None
-        return self._visible_indices[row]
-
-    def _visible_row_for_record_index(self, record_index: int) -> int:
-        for row, visible_record_index in enumerate(self._visible_indices):
-            if visible_record_index == record_index:
-                return row
-        return -1
-
-    def _select_record_row(self, record_index: int) -> None:
-        row = self._visible_row_for_record_index(record_index)
-        if row < 0:
-            return
-        self._table.selectRow(row)
-        self._table.setCurrentCell(row, 0)
-
-    def _reset_continuous_queue(self) -> None:
-        self._continuous_queue = []
-        self._continuous_queue_position = -1
-
-    def _play_record(self, record_index: int) -> bool:
-        if self._player is None:
-            return False
-        if record_index < 0 or record_index >= len(self._records):
-            return False
-
-        record = self._records[record_index]
-        if not record.path.exists():
-            return False
-
-        self._apply_output_device()
-        self._apply_player_loop_mode()
-        self._player.setSource(QUrl.fromLocalFile(str(record.path)))
-        self._player.play()
-        self._current_playing_name = record.path.name
-        self._select_record_row(record_index)
-
-        mode_text = ""
-        if self._playback_mode == "loop":
-            mode_text = " (loop)"
-        elif self._continuous_queue:
-            total = len(self._continuous_queue)
-            current = self._continuous_queue_position + 1 if total > 0 else 1
-            if self._playback_mode == "continuous":
-                mode_text = f" (continuous {current}/{max(total, 1)})"
-            else:
-                mode_text = f" (queue {current}/{max(total, 1)})"
-        self._status.showMessage(f"Playing: {record.path.name}{mode_text}")
-        return True
-
-    def _start_continuous_playback(self) -> bool:
-        selected_record_index = self._selected_record_index()
-        if selected_record_index is None:
-            self._status.showMessage("Select a jingle first.")
-            return False
-
-        start_row = self._visible_row_for_record_index(selected_record_index)
-        if start_row < 0:
-            return False
-
-        self._continuous_queue = list(self._visible_indices[start_row:])
-        if not self._continuous_queue:
-            return False
-
-        self._continuous_queue_position = -1
-        return self._play_next_continuous_record()
-
-    def _start_selected_queue_playback(self) -> bool:
-        selected_indices = self._selected_record_indices()
-        if len(selected_indices) < 2:
-            return False
-
-        self._continuous_queue = list(selected_indices)
-        self._continuous_queue_position = -1
-        return self._play_next_continuous_record()
-
-    def _play_next_continuous_record(self) -> bool:
-        if self._player is None:
-            return False
-
-        next_position = self._continuous_queue_position + 1
-        while next_position < len(self._continuous_queue):
-            record_index = self._continuous_queue[next_position]
-            self._continuous_queue_position = next_position
-            if self._play_record(record_index):
-                return True
-            next_position += 1
-
-        self._reset_continuous_queue()
-        return False
-
-    def _on_play_clicked(self) -> None:
-        if self._player is None:
-            self._status.showMessage("Playback unavailable: PyQt6 multimedia is not installed.")
-            return
-
-        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self._player.pause()
-            self._status.showMessage("Playback paused.")
-            return
-
-        if self._player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
-            self._player.play()
-            self._status.showMessage("Playback resumed.")
-            return
-
-        selected_record_index = self._selected_record_index()
-        if selected_record_index is None:
-            self._status.showMessage("Select a jingle first.")
-            return
-
-        if self._playback_mode == "continuous":
-            if not self._start_continuous_playback():
-                self._current_playing_name = ""
-                self._status.showMessage("No playable jingles were found from the selected row onward.")
-            return
-
-        if self._playback_mode == "off" and self._start_selected_queue_playback():
-            return
-
-        self._reset_continuous_queue()
-        record = self._records[selected_record_index]
-        if not record.path.exists():
-            self._status.showMessage("Selected file no longer exists.")
-            return
-
-        self._play_record(selected_record_index)
-
-    def _on_stop_clicked(self) -> None:
-        if self._player is None:
-            self._status.showMessage("Playback unavailable: PyQt6 multimedia is not installed.")
-            return
-
-        if self._player.playbackState() in (
-            QMediaPlayer.PlaybackState.PlayingState,
-            QMediaPlayer.PlaybackState.PausedState,
-        ):
-            self._player.stop()
-            self._player.setPosition(0)
-            self._reset_continuous_queue()
-            self._current_playing_name = ""
-            self._status.showMessage("Playback stopped.")
-
-    def _on_table_selection_changed(self) -> None:
-        record = self._selected_record()
-        if record is not None:
-            self._bulk_category_edit.setText(_tags_to_text(record.categories))
-        else:
-            self._bulk_category_edit.clear()
-        self._refresh_status_summary()
-
-    def _on_duration_changed(self, duration_ms: int) -> None:
-        self._position_slider.setRange(0, max(0, duration_ms))
-        self._update_time_label(self._player.position() if self._player is not None else 0, duration_ms)
-
-    def _on_position_changed(self, position_ms: int) -> None:
-        if not self._slider_pressed:
-            self._position_slider.setValue(position_ms)
-        duration = self._player.duration() if self._player is not None else 0
-        self._update_time_label(position_ms, duration)
-
-    def _on_playback_state_changed(self, _state: Any) -> None:
-        if self._player is None:
-            return
-        is_playing = self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-        self._set_play_button_state(is_playing)
-        # Only reset slider when stopped, not when paused
-        is_stopped = self._player.playbackState() == QMediaPlayer.PlaybackState.StoppedState
-        if is_stopped:
-            self._position_slider.setValue(0)
-        # Make stop button breathe when playing or paused
-        is_active = self._player.playbackState() in (
-            QMediaPlayer.PlaybackState.PlayingState,
-            QMediaPlayer.PlaybackState.PausedState,
-        )
-        self._set_stop_button_breathing(is_active)
-
-    def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
-        if self._player is None:
-            return
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            ended_name = self._current_playing_name
-            if self._play_next_continuous_record():
-                return
-            self._reset_continuous_queue()
-            self._current_playing_name = ""
-            if ended_name:
-                self._status.showMessage(f"Playback finished: {ended_name}")
-            else:
-                self._status.showMessage("Playback finished.")
-
-    def _refresh_playback_mode_button(self) -> None:
-        if self._playback_mode == "loop":
-            self._loop_btn.setText("Loop On")
-            self._loop_btn.setStyleSheet(
-                "QPushButton { background-color: #0d47a1; color: white; font-weight: bold; }"
-                "QPushButton:hover { background-color: #1565c0; }"
-            )
-            self._set_loop_breathing(self._loop_btn.isEnabled())
-        elif self._playback_mode == "continuous":
-            self._loop_btn.setText("Continuous")
-            self._loop_btn.setStyleSheet(
-                "QPushButton { background-color: #ef6c00; color: white; font-weight: bold; }"
-                "QPushButton:hover { background-color: #fb8c00; }"
-            )
-            self._set_loop_breathing(self._loop_btn.isEnabled())
-        else:
-            self._loop_btn.setText("Loop Off")
-            self._loop_btn.setStyleSheet("")
-            self._set_loop_breathing(False)
-
-    def _on_loop_clicked(self) -> None:
-        if self._playback_mode == "off":
-            self._playback_mode = "loop"
-        elif self._playback_mode == "loop":
-            self._playback_mode = "continuous"
-        else:
-            self._playback_mode = "off"
-        self._refresh_playback_mode_button()
-        self._apply_player_loop_mode()
-
-        # Switching to Loop Off: clear any active queue so the current track
-        # finishes and playback stops naturally.
-        if self._playback_mode == "off":
-            self._reset_continuous_queue()
-            return
-
-        # If switching to continuous while playback is active, seed the queue
-        # from the currently playing row so the next EndOfMedia can advance.
-        if (
-            self._playback_mode == "continuous"
-            and self._player is not None
-            and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-            and not self._continuous_queue
-        ):
-            current_index = self._selected_record_index()
-            if current_index is not None:
-                start_row = self._visible_row_for_record_index(current_index)
-                if start_row >= 0:
-                    self._continuous_queue = list(self._visible_indices[start_row:])
-                    # Position 0 is the currently playing track; next advance starts at 1.
-                    self._continuous_queue_position = 0
-
-    def _apply_player_loop_mode(self) -> None:
-        if self._player is None:
-            return
-        # Native backend looping avoids manual restart gaps between iterations.
-        self._player.setLoops(-1 if self._playback_mode == "loop" else 1)
-
-    def _set_loop_breathing(self, enabled: bool) -> None:
-        if not enabled:
-            if self._loop_breath_anim is not None:
-                self._loop_breath_anim.stop()
-            if self._loop_breath_effect is not None:
-                try:
-                    self._loop_breath_effect.setOpacity(1.0)
-                except RuntimeError:
-                    pass
-            self._loop_btn.setGraphicsEffect(None)
-            self._loop_breath_anim = None
-            self._loop_breath_effect = None
-            return
-
-        if self._loop_breath_effect is None:
-            self._loop_breath_effect = QGraphicsOpacityEffect(self._loop_btn)
-        try:
-            self._loop_btn.setGraphicsEffect(self._loop_breath_effect)
-        except RuntimeError:
-            self._loop_breath_effect = QGraphicsOpacityEffect(self._loop_btn)
-            self._loop_btn.setGraphicsEffect(self._loop_breath_effect)
-            self._loop_breath_anim = None
-
-        if self._loop_breath_anim is None:
-            self._loop_breath_anim = QPropertyAnimation(
-                self._loop_breath_effect,
-                b"opacity",
-                self,
-            )
-            self._loop_breath_anim.setDuration(1100)
-            self._loop_breath_anim.setStartValue(1.0)
-            self._loop_breath_anim.setKeyValueAt(0.5, 0.72)
-            self._loop_breath_anim.setEndValue(1.0)
-            self._loop_breath_anim.setLoopCount(-1)
-            self._loop_breath_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
-
-        self._loop_breath_anim.start()
-
-    def _set_play_button_state(self, is_playing: bool) -> None:
-        if is_playing:
-            self._play_btn.setText("Pause")
-            self._play_btn.setStyleSheet(
-                "QPushButton { background-color: #f57c00; color: white; font-weight: bold; }"
-                "QPushButton:hover { background-color: #e65100; }"
-            )
-            self._set_play_stop_breathing(self._play_btn.isEnabled())
-        else:
-            self._play_btn.setText("Play Selected")
-            self._play_btn.setStyleSheet(
-                "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; }"
-                "QPushButton:hover { background-color: #388e3c; }"
-            )
-            self._set_play_stop_breathing(False)
-
-    def _set_play_stop_breathing(self, enabled: bool) -> None:
-        if not enabled:
-            if self._play_stop_breath_anim is not None:
-                self._play_stop_breath_anim.stop()
-            if self._play_stop_breath_effect is not None:
-                try:
-                    self._play_stop_breath_effect.setOpacity(1.0)
-                except RuntimeError:
-                    pass
-            self._play_btn.setGraphicsEffect(None)
-            self._play_stop_breath_anim = None
-            self._play_stop_breath_effect = None
-            return
-
-        if self._play_stop_breath_effect is None:
-            self._play_stop_breath_effect = QGraphicsOpacityEffect(self._play_btn)
-        try:
-            self._play_btn.setGraphicsEffect(self._play_stop_breath_effect)
-        except RuntimeError:
-            self._play_stop_breath_effect = QGraphicsOpacityEffect(self._play_btn)
-            self._play_btn.setGraphicsEffect(self._play_stop_breath_effect)
-            self._play_stop_breath_anim = None
-
-        if self._play_stop_breath_anim is None:
-            self._play_stop_breath_anim = QPropertyAnimation(
-                self._play_stop_breath_effect,
-                b"opacity",
-                self,
-            )
-            self._play_stop_breath_anim.setDuration(1000)
-            self._play_stop_breath_anim.setStartValue(1.0)
-            self._play_stop_breath_anim.setKeyValueAt(0.5, 0.68)
-            self._play_stop_breath_anim.setEndValue(1.0)
-            self._play_stop_breath_anim.setLoopCount(-1)
-            self._play_stop_breath_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
-
-        self._play_stop_breath_anim.start()
-
-    def _set_stop_button_breathing(self, enabled: bool) -> None:
-        if not enabled:
-            if self._stop_btn_breath_anim is not None:
-                self._stop_btn_breath_anim.stop()
-            if self._stop_btn_breath_effect is not None:
-                try:
-                    self._stop_btn_breath_effect.setOpacity(1.0)
-                except RuntimeError:
-                    pass
-            self._stop_btn.setGraphicsEffect(None)
-            self._stop_btn_breath_anim = None
-            self._stop_btn_breath_effect = None
-            return
-
-        if self._stop_btn_breath_effect is None:
-            self._stop_btn_breath_effect = QGraphicsOpacityEffect(self._stop_btn)
-        try:
-            self._stop_btn.setGraphicsEffect(self._stop_btn_breath_effect)
-        except RuntimeError:
-            self._stop_btn_breath_effect = QGraphicsOpacityEffect(self._stop_btn)
-            self._stop_btn.setGraphicsEffect(self._stop_btn_breath_effect)
-            self._stop_btn_breath_anim = None
-
-        if self._stop_btn_breath_anim is None:
-            self._stop_btn_breath_anim = QPropertyAnimation(
-                self._stop_btn_breath_effect,
-                b"opacity",
-                self,
-            )
-            self._stop_btn_breath_anim.setDuration(1000)
-            self._stop_btn_breath_anim.setStartValue(1.0)
-            self._stop_btn_breath_anim.setKeyValueAt(0.5, 0.68)
-            self._stop_btn_breath_anim.setEndValue(1.0)
-            self._stop_btn_breath_anim.setLoopCount(-1)
-            self._stop_btn_breath_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
-
-        self._stop_btn_breath_anim.start()
-
-    def _on_slider_pressed(self) -> None:
-        self._slider_pressed = True
-
-    def _on_slider_released(self) -> None:
-        self._slider_pressed = False
-        if self._player is not None:
-            self._player.setPosition(int(self._position_slider.value()))
-
-    def _update_time_label(self, position_ms: int, duration_ms: int) -> None:
-        self._time_label.setText(
-            f"{self._fmt_time(position_ms)} / {self._fmt_time(duration_ms)}"
-        )
-
-    @staticmethod
-    def _fmt_time(ms: int) -> str:
-        total = max(0, int(ms / 1000))
-        minutes, seconds = divmod(total, 60)
-        hours, minutes = divmod(minutes, 60)
-        if hours > 0:
-            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-        return f"{minutes:02d}:{seconds:02d}"
-
-    def _on_open_options(self) -> None:
-        dialog = OptionsDialog(
-            self._output_device,
-            self._preview_output_device,
-            self._live_volume_percent,
-            self._preview_volume_percent,
-            self._samples_dir,
+        confirm = QMessageBox.question(
             self,
+            "Rename Files From Table",
+            "This will rename WAV files on disk to match the titles entered in the chapter table.\n\n"
+            "Files whose name already matches their title will be skipped.\n\n"
+            "Are you sure you want to proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        import re
+
+        def _safe_stem(title: str) -> str:
+            """Strip characters illegal in Windows/POSIX filenames."""
+            cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip(". ")
+            return cleaned or "untitled"
+
+        renamed = 0
+        skipped = 0
+        errors: list[str] = []
+
+        for row in sorted(self._source_files):
+            old_path = self._source_files[row]
+            title_item = self._table.item(row, 1)
+            title = title_item.text().strip() if title_item is not None else ""
+            if not title:
+                skipped += 1
+                continue
+
+            new_stem = _safe_stem(title)
+            new_path = old_path.with_name(new_stem + old_path.suffix)
+
+            if new_path == old_path:
+                skipped += 1
+                continue
+
+            if new_path.exists():
+                errors.append(
+                    f"Row {row + 1}: target already exists \u2014 \"{new_path.name}\""
+                )
+                continue
+
+            try:
+                old_path.rename(new_path)
+            except OSError as exc:
+                errors.append(f"Row {row + 1}: {exc}")
+                continue
+
+            self._source_files[row] = new_path
+            renamed += 1
+
+        lines = [f"Renamed: {renamed}  Skipped (already correct): {skipped}"]
+        if errors:
+            lines.append("\nErrors:")
+            lines.extend(f"  {e}" for e in errors)
+            QMessageBox.warning(
+                self,
+                "Rename Files From Table",
+                "\n".join(lines),
+            )
+        else:
+            self._status.showMessage(
+                f"Rename complete \u2014 {renamed} renamed, {skipped} already correct."
+            )
+
+    def _on_tools_options(self) -> None:
+        dialog = OptionsDialog(
+            use_vbr=self._use_vbr,
+            vbr_quality=self._vbr_quality,
+            cbr_bitrate_kbps=self._cbr_bitrate_kbps,
+            channels=self._channels,
+            size_limit_text=self._size_limit_text,
+            size_unit=self._size_limit_unit,
+            preview_device=self._preview_device,
+            parent=self,
         )
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
             return
 
-        self._output_device, self._preview_output_device = dialog.selected_devices()
-        self._live_volume_percent, self._preview_volume_percent = dialog.selected_volumes()
-        self._settings.setValue("options/outputDevice", self._output_device)
-        self._settings.setValue("options/previewOutputDevice", self._preview_output_device)
-        self._save_volume_settings()
-        self._refresh_mode_toggle_state(notify_if_disabled=True)
-        self._refresh_volume_controls()
-        self._apply_output_device()
-
-        new_dir = dialog.selected_folder()
-        if new_dir != self._samples_dir:
-            self._samples_dir = new_dir
-            self._save_samples_dir()
-            self._rescan_library()
-
-        if not self._can_use_preview_mode():
-            QMessageBox.information(
-                self,
-                "Preview/Live Disabled",
-                "Live and Preview devices are currently the same.\n\n"
-                "Preview/Live switching is disabled until the Preview device is set to a different output.",
-            )
+        (
+            self._use_vbr,
+            self._vbr_quality,
+            self._cbr_bitrate_kbps,
+            self._channels,
+            self._size_limit_text,
+            self._size_limit_unit,
+            self._preview_device,
+        ) = dialog.values()
+        self._save_options_to_settings()
         self._status.showMessage("Options saved.")
 
-    def _apply_output_device(self) -> None:
-        if self._audio_output is None or not _has_qt_multimedia:
+    def _load_options_from_settings(self) -> None:
+        self._use_vbr = self._settings.value("options/useVbr", DEFAULT_USE_VBR, type=bool)
+        self._vbr_quality = self._settings.value(
+            "options/vbrQuality",
+            DEFAULT_VBR_QUALITY,
+            type=int,
+        )
+        self._cbr_bitrate_kbps = self._settings.value(
+            "options/cbrBitrateKbps",
+            DEFAULT_CBR_BITRATE,
+            type=int,
+        )
+        self._channels = self._settings.value("options/channels", DEFAULT_CHANNELS, type=int)
+        size_limit_value = self._settings.value("options/sizeLimitText", DEFAULT_SIZE_LIMIT_TEXT)
+        self._size_limit_text = str(size_limit_value).strip() if size_limit_value is not None else DEFAULT_SIZE_LIMIT_TEXT
+        size_unit_value = self._settings.value("options/sizeLimitUnit", DEFAULT_SIZE_UNIT)
+        self._size_limit_unit = str(size_unit_value).strip() if size_unit_value is not None else DEFAULT_SIZE_UNIT
+        preview_device_value = self._settings.value("options/previewDevice", DEFAULT_PREVIEW_DEVICE)
+        self._preview_device = str(preview_device_value).strip() if preview_device_value is not None else DEFAULT_PREVIEW_DEVICE
+
+        self._vbr_quality = max(0, min(9, int(self._vbr_quality)))
+        self._cbr_bitrate_kbps = max(48, min(384, int(self._cbr_bitrate_kbps)))
+        if int(self._channels) not in (1, 2):
+            self._channels = DEFAULT_CHANNELS
+        valid_units = {"b", "kb", "Mb", "Gb", "B", "KB", "MB", "GB"}
+        if self._size_limit_unit not in valid_units:
+            self._size_limit_unit = DEFAULT_SIZE_UNIT
+        self._preview_device = self._preview_device.strip()
+
+    def _save_options_to_settings(self) -> None:
+        self._settings.setValue("options/useVbr", self._use_vbr)
+        self._settings.setValue("options/vbrQuality", int(self._vbr_quality))
+        self._settings.setValue("options/cbrBitrateKbps", int(self._cbr_bitrate_kbps))
+        self._settings.setValue("options/channels", int(self._channels))
+        self._settings.setValue("options/sizeLimitText", self._size_limit_text)
+        self._settings.setValue("options/sizeLimitUnit", self._size_limit_unit)
+        self._settings.setValue("options/previewDevice", self._preview_device)
+
+    def _default_open_wav_dir(self) -> str:
+        remembered_dir = self._settings.value("lastOpenWavDir", "")
+        remembered_text = str(remembered_dir).strip() if remembered_dir is not None else ""
+        if remembered_text:
+            remembered_path = Path(remembered_text)
+            if remembered_path.is_dir():
+                return str(remembered_path)
+
+        if self._wav_path is not None and self._wav_path.parent.is_dir():
+            return str(self._wav_path.parent)
+
+        return ""
+
+    def _on_open_wav(self) -> None:
+        start_dir = self._default_open_wav_dir()
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Open WAV File", start_dir, "WAV Files (*.wav)"
+        )
+        if path_str:
+            selected_parent = Path(path_str).parent
+            if selected_parent.is_dir():
+                self._settings.setValue("lastOpenWavDir", str(selected_parent))
+            self._load_wav(Path(path_str))
+
+    def _on_reset_clicked(self) -> None:
+        self._stop_preview(update_status=False)
+        self._clear_cached_intermediate(delete_file=True)
+
+        self._wav_path = None
+        self._output_dir = None
+        self._chapters.clear()
+        self._original_chapters.clear()
+        self._missing_cover_rows.clear()
+        self._row_cover_paths.clear()
+        self._source_files.clear()
+        self._is_individual_files_mode = False
+        self._next_cover_action = "all"
+
+        self._file_label.setText("No file selected")
+        self._book_title_edit.blockSignals(True)
+        self._book_title_edit.clear()
+        self._book_title_edit.blockSignals(False)
+        self._set_output_path(None)
+        self._duration_edit.clear()
+
+        self._table.clearContents()
+        self._table.setRowCount(0)
+        self._clear_table_encode_progress(reset_timeline=True)
+        self._update_cover_preview(None)
+
+        self._set_controls_enabled(True)
+        self._save_as_btn.setEnabled(False)
+        self._covers_btn.setEnabled(False)
+        self._reset_markers_btn.setEnabled(False)
+
+        self._use_vbr = DEFAULT_USE_VBR
+        self._vbr_quality = DEFAULT_VBR_QUALITY
+        self._cbr_bitrate_kbps = DEFAULT_CBR_BITRATE
+        self._channels = DEFAULT_CHANNELS
+        self._size_limit_text = DEFAULT_SIZE_LIMIT_TEXT
+        self._size_limit_unit = DEFAULT_SIZE_UNIT
+        self._preview_device = DEFAULT_PREVIEW_DEVICE
+        self._save_options_to_settings()
+
+        self._set_encode_btn_state("encode")
+        self._encode_btn.setEnabled(False)
+        self._encode_progress.setValue(0)
+
+        self._reset_main_splitter_to_initial()
+        self._status.showMessage("Open a WAV file to begin.")
+
+    def _build_intermediate_signature(
+        self,
+        chapters: list[Chapter],
+        source_files: dict[int, Path],
+    ) -> str:
+        lines: list[str] = []
+        if source_files:
+            lines.append("mode=playlist")
+            for row in range(len(chapters)):
+                src = source_files.get(row)
+                lines.append(f"src={src.resolve() if src is not None else ''}")
+        else:
+            lines.append("mode=single")
+            lines.append(f"input={self._wav_path.resolve() if self._wav_path is not None else ''}")
+
+        for chapter in chapters:
+            lines.append(
+                f"{chapter.title}\x1f{chapter.start_ms}\x1f{chapter.end_ms}"
+            )
+        return "\n".join(lines)
+
+    def _current_intermediate_signature(self) -> str:
+        return self._build_intermediate_signature(self._chapters, self._source_files)
+
+    def _has_cached_intermediate(self) -> bool:
+        return (
+            self._cached_intermediate_wav is not None
+            and self._cached_intermediate_wav.exists()
+            and self._cached_intermediate_signature is not None
+        )
+
+    def _clear_cached_intermediate(self, delete_file: bool) -> None:
+        cached = self._cached_intermediate_wav
+        if delete_file and cached is not None:
+            try:
+                cached.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        self._cached_intermediate_wav = None
+        self._cached_intermediate_signature = None
+        self._cached_intermediate_source_chapters = []
+        self._cached_intermediate_encode_chapters = []
+        self._cached_intermediate_source_files = {}
+        self._cached_intermediate_cover_paths = {}
+        self._cached_intermediate_missing_rows = set()
+
+    def _cache_intermediate_for_reuse(
+        self,
+        wav_path: Path,
+        chapters_for_encode: list[Chapter],
+    ) -> None:
+        self._cached_intermediate_wav = wav_path
+        self._cached_intermediate_signature = self._current_intermediate_signature()
+        self._cached_intermediate_source_chapters = list(self._chapters)
+        self._cached_intermediate_encode_chapters = list(chapters_for_encode)
+        self._cached_intermediate_source_files = dict(self._source_files)
+        self._cached_intermediate_cover_paths = dict(self._row_cover_paths)
+        self._cached_intermediate_missing_rows = set(self._missing_cover_rows)
+
+    def _delete_cached_intermediate_for_quit(self) -> bool:
+        """Delete any saved intermediate WAV before app quit.
+
+        Returns True when no cached intermediate exists or deletion succeeds.
+        Returns False if a cached file still exists after deletion attempts.
+        """
+        cached = self._cached_intermediate_wav
+        if cached is None:
+            self._clear_cached_intermediate(delete_file=False)
+            return True
+
+        try:
+            cached.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        if cached.exists():
+            return False
+
+        self._clear_cached_intermediate(delete_file=False)
+        return True
+
+    def _on_reset_markers_clicked(self) -> None:
+        if not self._chapters or not self._original_chapters:
             return
 
-        selected = self._active_output_device().strip()
-        target_device = QMediaDevices.defaultAudioOutput()
+        reply = QMessageBox.question(
+            self,
+            "Reset Chapter Markers",
+            "Reset chapter titles/markers in the list back to the original WAV values?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self._status.showMessage("Marker reset cancelled.")
+            return
 
-        if selected:
-            matched = None
-            for device in QMediaDevices.audioOutputs():
-                if device.description().strip() == selected:
-                    matched = device
-                    break
-            if matched is not None:
-                target_device = matched
+        self._chapters = list(self._original_chapters)
+        self._encode_progress_timeline.clear()
+        self._missing_cover_rows.clear()
+        self._row_cover_paths.clear()
+        self._next_cover_action = "all"
+        self._populate_table(self._chapters)
+        self._update_cover_preview(None)
+        self._status.showMessage("Chapter list reset to original WAV markers.")
+
+    def _on_remove_selected_chapter(self) -> None:
+        if not self._source_files:
+            self._status.showMessage("Remove is only available in manual files mode.")
+            return
+        if not self._chapters:
+            return
+
+        self._stop_preview(update_status=False)
+
+        selected_ranges = self._table.selectedRanges()
+        if not selected_ranges:
+            self._status.showMessage("Select a chapter row to remove.")
+            return
+        remove_row = selected_ranges[0].topRow()
+        if remove_row < 0 or remove_row >= len(self._chapters):
+            return
+
+        old_chapters = list(self._chapters)
+        old_source_files = dict(self._source_files)
+        old_cover_paths = dict(self._row_cover_paths)
+        old_missing_rows = set(self._missing_cover_rows)
+
+        del old_chapters[remove_row]
+
+        new_chapters: list[Chapter] = []
+        new_source_files: dict[int, Path] = {}
+        new_cover_paths: dict[int, Path] = {}
+        new_missing_rows: set[int] = set()
+        cursor_ms = 0
+
+        for old_row, chapter in enumerate(old_chapters):
+            # old_row indexes into list with removed row already deleted.
+            source_row = old_row if old_row < remove_row else old_row + 1
+            duration_ms = max(1, chapter.end_ms - chapter.start_ms)
+            start_ms = cursor_ms
+            end_ms = start_ms + duration_ms
+            new_row = len(new_chapters)
+
+            new_chapters.append(
+                Chapter(
+                    index=new_row + 1,
+                    title=chapter.title,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                )
+            )
+            cursor_ms = end_ms
+
+            source_path = old_source_files.get(source_row)
+            if source_path is not None:
+                new_source_files[new_row] = source_path
+
+            cover_path = old_cover_paths.get(source_row)
+            if cover_path is not None:
+                new_cover_paths[new_row] = cover_path
+
+            if source_row in old_missing_rows:
+                new_missing_rows.add(new_row)
+
+        self._chapters = new_chapters
+        self._source_files = new_source_files
+        self._row_cover_paths = new_cover_paths
+        self._missing_cover_rows = new_missing_rows
+        self._next_cover_action = "missing" if self._missing_cover_rows else "prompt_force_all"
+
+        self._populate_table(self._chapters)
+
+        for row, cover_path in self._row_cover_paths.items():
+            lbl = self._table.cellWidget(row, 4)
+            if not isinstance(lbl, QLabel):
+                continue
+            px = QPixmap(str(cover_path))
+            if px.isNull():
+                continue
+            lbl.setPixmap(
+                px.scaled(
+                    THUMB_SIZE,
+                    THUMB_SIZE,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+        if self._chapters:
+            select_row = min(remove_row, len(self._chapters) - 1)
+            self._table.selectRow(select_row)
+            self._update_cover_preview(select_row)
+            self._duration_edit.setText(_format_duration_label(self._chapters[-1].end_ms / 1000.0))
+            self._status.showMessage("Removed selected chapter.")
+        else:
+            self._update_cover_preview(None)
+            self._duration_edit.clear()
+            self._covers_btn.setEnabled(False)
+            self._encode_btn.setEnabled(False)
+            self._reset_markers_btn.setEnabled(False)
+            self._remove_chapter_btn.setEnabled(False)
+            self._status.showMessage("Removed selected chapter. Chapter list is now empty.")
+
+    def _on_add_wav_files(self) -> None:
+        """Open file dialog to add individual WAV files as chapters."""
+        start_dir = ""
+        if self._output_dir is not None and self._output_dir.is_dir():
+            start_dir = str(self._output_dir)
+        
+        raw_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add WAV Files as Chapters",
+            start_dir,
+            "WAV Files (*.wav);;All Files (*)",
+        )
+
+        if raw_paths:
+            # Remember the directory where files were selected from
+            self._output_dir = Path(raw_paths[0]).parent
+            self._add_chapters_from_files([Path(p) for p in raw_paths])
+
+    def _default_playlist_dir(self) -> str:
+        remembered_dir = self._settings.value("lastPlaylistDir", "")
+        remembered_text = str(remembered_dir).strip() if remembered_dir is not None else ""
+        if remembered_text:
+            remembered_path = Path(remembered_text)
+            if remembered_path.is_dir():
+                return str(remembered_path)
+        if self._output_dir is not None and self._output_dir.is_dir():
+            return str(self._output_dir)
+        return ""
+
+    def _on_export_playlist(self) -> bool:
+        if not self._chapters or not self._source_files:
+            self._status.showMessage("Export playlist requires manually added WAV files.")
+            return False
+
+        ordered_paths: list[Path] = []
+        for row in range(len(self._chapters)):
+            source_path = self._source_files.get(row)
+            if source_path is None:
+                self._status.showMessage(
+                    "Cannot export playlist: one or more chapter rows have no source file."
+                )
+                return False
+            ordered_paths.append(source_path)
+
+        default_dir = self._default_playlist_dir()
+        default_name = f"{_sanitize_output_stem(self._current_book_title() or 'chapter_order')}.abspl"
+        start_path = str(Path(default_dir) / default_name) if default_dir else default_name
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Playlist",
+            start_path,
+            "AudioBook Slicer Playlist (*.abspl);;M3U Playlist (*.m3u8);;Text Files (*.txt)",
+        )
+        if not path_str:
+            return False
+
+        playlist_path = Path(path_str)
+        if not playlist_path.suffix:
+            playlist_path = playlist_path.with_suffix(".abspl")
+
+        lines = ["# AudioBookSlicer playlist v1", *[str(path) for path in ordered_paths]]
+        playlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if playlist_path.parent.is_dir():
+            self._settings.setValue("lastPlaylistDir", str(playlist_path.parent))
+        self._status.showMessage(
+            f"Exported playlist with {len(ordered_paths)} file(s) — {playlist_path.name}"
+        )
+        return True
+
+    def _on_import_playlist(self) -> None:
+        default_dir = self._default_playlist_dir()
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Playlist",
+            default_dir,
+            "Playlists (*.abspl *.m3u *.m3u8 *.txt);;All Files (*)",
+        )
+        if not path_str:
+            return
+
+        playlist_path = Path(path_str)
+        if playlist_path.parent.is_dir():
+            self._settings.setValue("lastPlaylistDir", str(playlist_path.parent))
+
+        try:
+            raw_lines = playlist_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            self._status.showMessage(f"Could not read playlist — {exc}")
+            return
+
+        paths: list[Path] = []
+        for line in raw_lines:
+            text = line.strip()
+            if not text or text.startswith("#"):
+                continue
+            parsed = Path(text).expanduser()
+            if not parsed.is_absolute():
+                parsed = (playlist_path.parent / parsed).resolve()
+            paths.append(parsed)
+
+        if not paths:
+            self._status.showMessage("Playlist contains no file paths.")
+            return
+
+        missing_paths = [path for path in paths if not path.exists()]
+        non_wav_paths = [path for path in paths if path.exists() and path.suffix.lower() != ".wav"]
+        if missing_paths or non_wav_paths:
+            details: list[str] = []
+            if missing_paths:
+                preview = ", ".join(str(path) for path in missing_paths[:3])
+                extra = len(missing_paths) - 3
+                if extra > 0:
+                    preview = f"{preview} (+{extra} more)"
+                details.append(f"Missing files: {preview}")
+            if non_wav_paths:
+                preview = ", ".join(str(path) for path in non_wav_paths[:3])
+                extra = len(non_wav_paths) - 3
+                if extra > 0:
+                    preview = f"{preview} (+{extra} more)"
+                details.append(f"Non-WAV entries: {preview}")
+            QMessageBox.warning(
+                self,
+                "Playlist Import Failed",
+                "Cannot import playlist due to invalid entries.\n\n" + "\n".join(details),
+            )
+            self._status.showMessage("Playlist import failed due to invalid entries.")
+            return
+
+        if self._has_cached_intermediate():
+            prompt = QMessageBox(self)
+            prompt.setWindowTitle("Intermediate WAV Present")
+            prompt.setIcon(QMessageBox.Icon.Question)
+            prompt.setText(
+                "A saved intermediate WAV file is currently available.\n\n"
+                "What would you like to do before importing a new playlist?"
+            )
+            load_delete_btn = prompt.addButton(
+                "Load New Playlist and Delete WAV",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            cancel_keep_btn = prompt.addButton(
+                "Cancel Playlist Load and Keep WAV",
+                QMessageBox.ButtonRole.RejectRole,
+            )
+            prompt.setDefaultButton(cast(QPushButton, cancel_keep_btn))
+            prompt.exec()
+
+            clicked = prompt.clickedButton()
+            if clicked is load_delete_btn:
+                self._clear_cached_intermediate(delete_file=True)
             else:
                 self._status.showMessage(
-                    f"Selected device unavailable. Using system default: {target_device.description()}"
+                    "Playlist import cancelled. Saved intermediate WAV was kept."
+                )
+                return
+
+        if self._chapters:
+            reply = QMessageBox.question(
+                self,
+                "Replace Current Chapters",
+                "Importing a playlist will replace the current chapter list. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self._status.showMessage("Playlist import cancelled.")
+                return
+
+        self._on_reset_clicked()
+        self._add_chapters_from_files(paths)
+        self._file_label.setText(f"Playlist: {playlist_path.name}")
+        self._status.showMessage(f"Imported playlist with {len(paths)} file(s).")
+
+    def _add_chapters_from_files(self, file_paths: list[Path]) -> None:
+        """Add individual WAV files as chapters to the list."""
+        self._stop_preview(update_status=False)
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self._status.showMessage("Probing audio files…")
+            QApplication.processEvents()
+
+            ffprobe, err = _run_capturing_errors(ensure_executable, "ffprobe")
+            if err:
+                self._status.showMessage(f"ffprobe not found — {err}")
+                return
+
+            new_chapters: list[Chapter] = list(self._chapters)
+            added_count = 0
+
+            for file_path in file_paths:
+                # Probe file duration
+                result, err = _run_capturing_errors(probe_audio_info, ffprobe, file_path)
+                if err:
+                    self._status.showMessage(f"Cannot probe {file_path.name} — {err}")
+                    continue
+                assert result is not None
+                duration_sec, _ = result
+
+                # Create chapter from file
+                chapter_idx = len(new_chapters) + 1
+                title = file_path.stem
+                start_ms = 0 if not new_chapters else new_chapters[-1].end_ms
+                end_ms = start_ms + int(duration_sec * 1000)
+
+                new_chapter = Chapter(
+                    index=chapter_idx,
+                    title=title,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                )
+                new_chapters.append(new_chapter)
+
+                # Track source file by row
+                self._source_files[len(new_chapters) - 1] = file_path
+                added_count += 1
+
+            if added_count == 0:
+                self._status.showMessage("No files were added.")
+                return
+
+            # Update state
+            if not self._chapters:
+                # First time adding files - initialize
+                self._output_dir = file_paths[0].parent
+                self._chapters = new_chapters
+                self._original_chapters = list(new_chapters)
+                self._is_individual_files_mode = True
+                self._populate_table(self._chapters)
+                self._covers_btn.setEnabled(True)
+                self._save_as_btn.setEnabled(True)
+                self._reset_markers_btn.setEnabled(True)
+                self._remove_chapter_btn.setEnabled(True)
+                self._encode_btn.setEnabled(True)
+                self._encode_progress.setValue(0)
+                self._set_controls_enabled(True)
+                self._status.showMessage(f"Added {added_count} chapter(s).")
+            else:
+                # Adding to existing list
+                self._chapters = new_chapters
+                self._populate_table(self._chapters)
+                self._remove_chapter_btn.setEnabled(True)
+                self._set_controls_enabled(True)
+                self._status.showMessage(f"Added {added_count} chapter(s) to existing list.")
+
+            # Update duration display
+            if self._chapters:
+                total_duration = self._chapters[-1].end_ms / 1000.0
+                self._duration_edit.setText(_format_duration_label(total_duration))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+
+    def _load_wav(self, wav_path: Path) -> None:
+        self._stop_preview(update_status=False)
+        self._clear_cached_intermediate(delete_file=True)
+
+        self._status.showMessage("Reading markers…")
+        QApplication.processEvents()
+
+        # Clear individual files mode when loading traditional WAV
+        self._source_files.clear()
+        self._is_individual_files_mode = False
+
+        # Locate ffprobe
+        ffprobe, err = _run_capturing_errors(ensure_executable, "ffprobe")
+        if err:
+            self._status.showMessage(f"ffprobe not found — {err}")
+            return
+
+        # Get audio duration via ffprobe
+        result, err = _run_capturing_errors(probe_audio_info, ffprobe, wav_path)
+        if err:
+            self._status.showMessage(f"Cannot probe audio — {err}")
+            return
+        assert result is not None
+        duration_sec, _ = result
+
+        # Parse RIFF/WAV markers
+        result, err = _run_capturing_errors(read_riff_chunks, wav_path)
+        if err:
+            self._status.showMessage(f"Cannot read markers — {err}")
+            return
+        assert result is not None
+        sample_rate, markers = result
+
+        # Build chapter list from markers
+        chapters, err = _run_capturing_errors(
+            build_chapters, markers, sample_rate, duration_sec
+        )
+        if err:
+            self._status.showMessage(f"Cannot build chapters — {err}")
+            return
+        assert chapters is not None
+
+        self._wav_path = wav_path
+        self._output_dir = wav_path.parent
+        self._chapters = chapters
+        self._original_chapters = list(chapters)
+        self._encode_progress_timeline.clear()
+        self._missing_cover_rows.clear()
+        self._row_cover_paths.clear()
+        self._next_cover_action = "all"
+        self._file_label.setText(str(wav_path))
+        self._duration_edit.setText(_format_duration_label(duration_sec))
+        self._set_book_title(wav_path.stem, auto_unique_output=False)
+        initial_output_path = self._output_path_for_current_title()
+        if initial_output_path is not None:
+            resolved_output_path = self._resolve_output_conflict(
+                initial_output_path,
+                cancel_returns_none=False,
+            )
+            if resolved_output_path is not None:
+                self._output_path_edit.setText(str(resolved_output_path))
+        self._populate_table(chapters)
+        self._update_cover_preview(None)
+        self._covers_btn.setEnabled(True)
+        self._save_as_btn.setEnabled(True)
+        self._reset_markers_btn.setEnabled(True)
+        self._encode_btn.setEnabled(True)
+        self._encode_progress.setValue(0)
+        self._set_controls_enabled(True)
+
+        count = len(chapters)
+        noun = "chapter" if count == 1 else "chapters"
+        self._status.showMessage(f"Loaded {count} {noun} — {wav_path.name}")
+
+    def _set_book_title(self, title: str, auto_unique_output: bool = False) -> None:
+        self._book_title_edit.blockSignals(True)
+        self._book_title_edit.setText(title)
+        self._book_title_edit.blockSignals(False)
+        self._sync_output_path(auto_unique=auto_unique_output)
+
+    def _current_book_title(self) -> str:
+        return self._book_title_edit.text().strip()
+
+    def _output_path_for_current_title(self) -> Path | None:
+        if self._output_dir is None:
+            return None
+        stem = _sanitize_output_stem(self._current_book_title())
+        return self._output_dir / f"{stem}.mp3"
+
+    def _clear_output_conflict_memory(self) -> None:
+        self._remembered_conflict_path = None
+        self._remembered_conflict_choice = None
+
+    def _set_output_path(self, output_path: Path | None) -> None:
+        old_text = self._output_path_edit.text().strip()
+        new_text = str(output_path) if output_path is not None else ""
+        self._output_path_edit.setText(new_text)
+        if new_text != old_text:
+            self._clear_output_conflict_memory()
+
+    def _build_unique_output_path(self, output_path: Path) -> Path:
+        stem = output_path.stem
+        parent = output_path.parent
+        counter = 1
+        while True:
+            candidate = parent / f"{stem}({counter}).mp3"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    def _resolve_output_conflict(
+        self,
+        output_path: Path,
+        *,
+        cancel_returns_none: bool,
+        use_remembered_choice: bool = False,
+    ) -> Path | None:
+        if not output_path.exists():
+            return output_path
+
+        if (
+            use_remembered_choice
+            and self._remembered_conflict_path == output_path
+            and self._remembered_conflict_choice is not None
+        ):
+            if self._remembered_conflict_choice == "overwrite":
+                return output_path
+            if self._remembered_conflict_choice == "unique":
+                return self._build_unique_output_path(output_path)
+            if self._remembered_conflict_choice == "cancel":
+                return None if cancel_returns_none else output_path
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Overwrite Output")
+        msg_box.setText(f"The output file already exists:\n{output_path}\n\nWhat would you like to do?")
+        msg_box.setIcon(QMessageBox.Icon.Question)
+        overwrite_btn = msg_box.addButton("Overwrite", QMessageBox.ButtonRole.AcceptRole)
+        unique_btn = msg_box.addButton("Create Unique", QMessageBox.ButtonRole.ActionRole)
+        msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg_box.setDefaultButton(unique_btn)
+        msg_box.exec()
+        clicked = msg_box.clickedButton()
+
+        if clicked is overwrite_btn:
+            self._remembered_conflict_path = output_path
+            self._remembered_conflict_choice = "overwrite"
+            return output_path
+        if clicked is unique_btn:
+            self._remembered_conflict_path = output_path
+            self._remembered_conflict_choice = "unique"
+            return self._build_unique_output_path(output_path)
+        self._remembered_conflict_path = output_path
+        self._remembered_conflict_choice = "cancel"
+        if cancel_returns_none:
+            return None
+        return output_path
+
+    def _sync_output_path(self, auto_unique: bool = False) -> None:
+        output_path = self._output_path_for_current_title()
+        if output_path is not None and auto_unique and output_path.exists():
+            stem = output_path.stem
+            parent = output_path.parent
+            counter = 1
+            while True:
+                candidate = parent / f"{stem}({counter}).mp3"
+                if not candidate.exists():
+                    break
+                counter += 1
+            output_path = candidate
+        self._set_output_path(output_path)
+
+    def _on_book_title_changed(self, _text: str) -> None:
+        self._sync_output_path()
+
+    def _get_unpopulated_artwork_rows(self) -> list[int]:
+        return [row for row in range(len(self._chapters)) if row not in self._row_cover_paths]
+
+    def _update_cover_preview(self, row: int | None) -> None:
+        if row is None:
+            self._preview_base_pixmap = None
+            self._cover_preview.clear()
+            self._cover_preview.setText("No cover selected")
+            return
+
+        cover_path = self._row_cover_paths.get(row)
+        if cover_path is None:
+            self._preview_base_pixmap = None
+            self._cover_preview.clear()
+            self._cover_preview.setText("No cover available for selected chapter")
+            return
+
+        px = QPixmap(str(cover_path))
+        if px.isNull():
+            self._preview_base_pixmap = None
+            self._cover_preview.clear()
+            self._cover_preview.setText("Could not load cover preview")
+            return
+
+        self._preview_base_pixmap = px
+        self._refresh_cover_preview_pixmap()
+
+    def _build_encode_progress_timeline(self, chapters: list[Chapter]) -> list[Chapter]:
+        timeline: list[Chapter] = []
+        cursor_ms = 0
+        for row, chapter in enumerate(chapters, start=1):
+            duration_ms = max(1, chapter.end_ms - chapter.start_ms)
+            start_ms = cursor_ms
+            end_ms = start_ms + duration_ms
+            timeline.append(
+                Chapter(
+                    index=row,
+                    title=chapter.title,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                )
+            )
+            cursor_ms = end_ms
+        return timeline
+
+    def _clear_table_encode_progress(self, reset_timeline: bool = False) -> None:
+        for row in range(self._table.rowCount()):
+            title_item = self._table.item(row, 1)
+            if title_item is not None:
+                title_item.setData(CHAPTER_PROGRESS_ROLE, 0.0)
+        self._encode_progress_row = None
+        if reset_timeline:
+            self._encode_progress_timeline.clear()
+        viewport = self._table.viewport()
+        if viewport is not None:
+            viewport.update()
+
+    def _clear_table_preview_progress(self) -> None:
+        for row in range(self._table.rowCount()):
+            title_item = self._table.item(row, 1)
+            if title_item is not None:
+                title_item.setData(CHAPTER_PREVIEW_PROGRESS_ROLE, 0.0)
+        viewport = self._table.viewport()
+        if viewport is not None:
+            viewport.update()
+
+    def _update_table_preview_progress(self, row: int, progress: float) -> None:
+        self._clear_table_preview_progress()
+        if row < 0 or row >= self._table.rowCount():
+            return
+        title_item = self._table.item(row, 1)
+        if title_item is None:
+            return
+        title_item.setData(CHAPTER_PREVIEW_PROGRESS_ROLE, max(0.0, min(1.0, progress)))
+        viewport = self._table.viewport()
+        if viewport is not None:
+            viewport.update()
+
+    def _update_table_encode_progress(self, out_time_sec: float) -> None:
+        timeline = self._encode_progress_timeline or self._chapters
+        if out_time_sec < 0 or not timeline:
+            self._clear_table_encode_progress()
+            return
+
+        current_ms = int(out_time_sec * 1000.0)
+        for row, chapter in enumerate(timeline):
+            title_item = self._table.item(row, 1)
+            if title_item is None:
+                continue
+
+            is_last = row == len(self._chapters) - 1
+            if current_ms < chapter.start_ms:
+                row_progress = 0.0
+            elif current_ms >= chapter.end_ms and not is_last:
+                row_progress = 1.0
+            else:
+                chapter_span = max(1, chapter.end_ms - chapter.start_ms)
+                row_progress = max(
+                    0.0,
+                    min(1.0, (current_ms - chapter.start_ms) / chapter_span),
+                )
+            title_item.setData(CHAPTER_PROGRESS_ROLE, row_progress)
+
+        self._encode_progress_row = None
+        viewport = self._table.viewport()
+        if viewport is not None:
+            viewport.update()
+
+    def _refresh_cover_preview_pixmap(self) -> None:
+        if self._preview_base_pixmap is None:
+            return
+        target_w = max(80, self._cover_preview.width() - 8)
+        target_h = max(80, self._cover_preview.height() - 8)
+        scaled = self._preview_base_pixmap.scaled(
+            target_w,
+            target_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._cover_preview.setText("")
+        self._cover_preview.setPixmap(scaled)
+
+    def resizeEvent(self, a0: QResizeEvent | None) -> None:
+        super().resizeEvent(a0)
+        if not self._splitter_reset_pending:
+            self._splitter_reset_pending = True
+            QTimer.singleShot(0, self._apply_pending_splitter_reset)
+
+    def _on_main_splitter_moved(self, _pos: int, _index: int) -> None:
+        self._refresh_cover_preview_pixmap()
+
+    def _apply_pending_splitter_reset(self) -> None:
+        self._splitter_reset_pending = False
+        self._reset_main_splitter_to_initial()
+
+    def _reset_main_splitter_to_initial(self) -> None:
+        top_default, _bottom_default = self._initial_splitter_sizes
+        current_height = self._main_splitter.height()
+        if current_height <= 0:
+            self._main_splitter.setSizes([top_default, 460])
+            return
+
+        if self._default_splitter_top_px is None:
+            computed_top = top_default
+            if self._top_panel is not None:
+                top_hint = self._top_panel.minimumSizeHint().height()
+                if top_hint > 0:
+                    computed_top = top_hint + int(self._splitter_top_padding_px)
+            self._default_splitter_top_px = computed_top
+
+        top_size = self._default_splitter_top_px
+
+        top_size = max(140, min(current_height - 120, top_size))
+        bottom_size = max(120, current_height - top_size)
+        self._main_splitter.setSizes([top_size, bottom_size])
+        self._refresh_cover_preview_pixmap()
+
+    def changeEvent(self, a0: QEvent | None) -> None:
+        super().changeEvent(a0)
+        if a0 is None or a0.type() != QEvent.Type.WindowStateChange:
+            return
+        is_maximized = self.isMaximized()
+        if self._was_maximized and not is_maximized:
+            QTimer.singleShot(0, self._reset_main_splitter_to_initial)
+        self._was_maximized = is_maximized
+
+    def _on_exit_requested(self) -> None:
+        self.close()
+
+    def _is_split_running(self) -> bool:
+        return (
+            self._split_process is not None
+            and self._split_process.state() != QProcess.ProcessState.NotRunning
+        )
+
+    def _cancel_split_operation(self) -> None:
+        if not self._is_split_running():
+            return
+
+        self._split_cancelled = True
+        process = self._split_process
+        if process is None:
+            return
+
+        # Fast cancellation: on Windows, kill the full process tree (python + ffmpeg).
+        if sys.platform == "win32":
+            pid = int(process.processId())
+            if pid > 0:
+                run_kwargs: dict[str, Any] = {
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                }
+                if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        check=False,
+                        **run_kwargs,
+                    )
+                except OSError:
+                    process.kill()
+                    return
+
+        # Non-Windows or fallback path.
+        process.kill()
+
+    def _has_active_operations(self) -> bool:
+        split_running = self._is_split_running()
+        encode_running = self._encode_thread is not None and self._encode_thread.isRunning()
+        return split_running or encode_running
+
+    def _request_cancel_active_operations(self) -> None:
+        if self._is_split_running():
+            self._cancel_split_operation()
+
+        if self._encode_thread is not None and self._encode_thread.isRunning():
+            if self._encode_worker is not None:
+                self._encode_worker.request_cancel()
+
+        self._encode_btn.setEnabled(False)
+        self._set_encode_btn_state("cancelling")
+        self._status.showMessage("Stopping active operations…")
+
+    def _wait_for_active_operations_to_stop(self, timeout_sec: float = 15.0) -> bool:
+        deadline = time.monotonic() + timeout_sec
+        while self._has_active_operations():
+            QApplication.processEvents()
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._stop_preview(update_status=False)
+
+        if self._has_active_operations():
+            reply = QMessageBox.question(
+                self,
+                "Active Operations Running",
+                "An encode or split operation is currently running.\n\n"
+                "If you quit now, the operation will be cancelled.\n\n"
+                "Do you want to proceed and quit?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+
+            self._request_cancel_active_operations()
+            if not self._wait_for_active_operations_to_stop():
+                QMessageBox.warning(
+                    self,
+                    "Unable To Quit Yet",
+                    "The active operation could not be stopped in time.\n"
+                    "Please wait a moment and try again.",
+                )
+                event.ignore()
+                return
+
+            if not self._delete_cached_intermediate_for_quit():
+                QMessageBox.warning(
+                    self,
+                    "Unable To Quit Yet",
+                    "A saved intermediate WAV file could not be deleted.\n"
+                    "Close any app using that file and try quitting again.",
+                )
+                event.ignore()
+                return
+
+            event.accept()
+            return
+
+        if self._chapters:
+            prompt = QMessageBox(self)
+            prompt.setWindowTitle("Quit")
+            prompt.setIcon(QMessageBox.Icon.Question)
+            prompt.setText(
+                "There are items in the chapter list.\n\n"
+                "Would you like to export the list before quitting?"
+            )
+            export_btn = prompt.addButton("Export List First", QMessageBox.ButtonRole.ActionRole)
+            quit_btn = prompt.addButton("Quit", QMessageBox.ButtonRole.AcceptRole)
+            cancel_btn = prompt.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            prompt.setDefaultButton(cast(QPushButton, export_btn))
+            prompt.exec()
+
+            clicked = prompt.clickedButton()
+            if clicked is cancel_btn:
+                event.ignore()
+                return
+
+            if clicked is export_btn:
+                exported = self._on_export_playlist()
+                if not exported:
+                    event.ignore()
+                    return
+
+            if clicked is quit_btn or clicked is export_btn:
+                if not self._delete_cached_intermediate_for_quit():
+                    QMessageBox.warning(
+                        self,
+                        "Unable To Quit Yet",
+                        "A saved intermediate WAV file could not be deleted.\n"
+                        "Close any app using that file and try quitting again.",
+                    )
+                    event.ignore()
+                    return
+                event.accept()
+                return
+
+            event.ignore()
+            return
+
+        if not self._delete_cached_intermediate_for_quit():
+            QMessageBox.warning(
+                self,
+                "Unable To Quit Yet",
+                "A saved intermediate WAV file could not be deleted.\n"
+                "Close any app using that file and try quitting again.",
+            )
+            event.ignore()
+            return
+
+        event.accept()
+
+    def _on_table_selection_changed(self) -> None:
+        selected_ranges = self._table.selectedRanges()
+        if not selected_ranges:
+            self._stop_preview(update_status=False)
+            self._update_cover_preview(None)
+            self._update_preview_controls(None)
+            return
+        selected_row = selected_ranges[0].topRow()
+        if self._is_preview_running() and self._preview_row != selected_row:
+            self._stop_preview(update_status=False)
+        self._update_cover_preview(selected_row)
+        self._update_preview_controls(selected_row)
+
+    def _on_save_as(self) -> None:
+        if self._output_dir is None:
+            return
+
+        default_path = self._output_path_for_current_title()
+        start_path = str(default_path) if default_path else str(self._output_dir)
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Output MP3 As",
+            start_path,
+            "MP3 Files (*.mp3)",
+        )
+        if not path_str:
+            return
+
+        selected_path = Path(path_str)
+        if selected_path.suffix.lower() != ".mp3":
+            selected_path = selected_path.with_suffix(".mp3")
+        self._output_dir = selected_path.parent
+        self._set_book_title(selected_path.stem, auto_unique_output=False)
+        self._set_output_path(selected_path)
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        if not enabled and self._is_preview_running():
+            self._stop_preview(update_status=False)
+
+        self._reset_btn.setEnabled(enabled)
+        self._reset_markers_btn.setEnabled(enabled and bool(self._chapters))
+        self._remove_chapter_btn.setEnabled(
+            enabled and bool(self._chapters) and bool(self._source_files)
+        )
+        self._save_as_btn.setEnabled(
+            enabled and (self._wav_path is not None or bool(self._source_files))
+        )
+        self._covers_btn.setEnabled(enabled and bool(self._chapters))
+        self._book_title_edit.setEnabled(enabled)
+        selected_row = self._selected_chapter_row()
+        self._preview_btn.setEnabled(enabled and selected_row is not None)
+
+        if self._action_open_wav is not None:
+            self._action_open_wav.setEnabled(enabled)
+        if self._action_add_wav_files is not None:
+            self._action_add_wav_files.setEnabled(enabled)
+        if self._action_import_playlist is not None:
+            self._action_import_playlist.setEnabled(enabled)
+        if self._action_export_playlist is not None:
+            self._action_export_playlist.setEnabled(enabled and bool(self._source_files))
+        if self._action_reset is not None:
+            self._action_reset.setEnabled(enabled)
+        if self._action_reset_markers is not None:
+            self._action_reset_markers.setEnabled(enabled and bool(self._chapters))
+        if self._action_remove_selected is not None:
+            self._action_remove_selected.setEnabled(
+                enabled and bool(self._chapters) and bool(self._source_files)
+            )
+        if self._action_split_m4b is not None:
+            self._action_split_m4b.setEnabled(enabled)
+        if self._action_rename_files is not None:
+            self._action_rename_files.setEnabled(enabled and bool(self._source_files))
+        if self._action_options is not None:
+            self._action_options.setEnabled(enabled)
+
+    def _get_size_limit_value(self) -> tuple[Decimal, str] | None:
+        text = self._size_limit_text.replace(",", "").replace(" ", "").strip()
+        if not text:
+            return None
+        try:
+            value = Decimal(text)
+        except InvalidOperation:
+            return None
+        if value <= Decimal("0"):
+            return None
+        unit = self._size_limit_unit
+        if not unit:
+            return None
+        return value, unit
+
+    def _actual_size_in_unit(self, actual_bytes: int, unit: str) -> Decimal:
+        as_decimal = Decimal(actual_bytes)
+        if unit == "b":
+            return as_decimal * Decimal(8)
+        if unit == "kb":
+            return (as_decimal * Decimal(8)) / Decimal(1000)
+        if unit == "Mb":
+            return (as_decimal * Decimal(8)) / Decimal(1_000_000)
+        if unit == "Gb":
+            return (as_decimal * Decimal(8)) / Decimal(1_000_000_000)
+        if unit == "B":
+            return as_decimal
+        if unit == "KB":
+            return as_decimal / Decimal(1000)
+        if unit == "MB":
+            return as_decimal / Decimal(1_000_000)
+        if unit == "GB":
+            return as_decimal / Decimal(1_000_000_000)
+        return as_decimal
+
+    def _set_encode_btn_state(self, state: str) -> None:
+        """state: 'encode' | 'cancel' | 'cancel_split' | 'cancelling'"""
+        if state == "encode":
+            self._encode_btn.setText("Encode MP3")
+            self._encode_btn.setStyleSheet(
+                "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #388e3c; }"
+                "QPushButton:disabled { background-color: #9e9e9e; color: #e0e0e0; }"
+            )
+        elif state == "cancel":
+            self._encode_btn.setText("Cancel Encode")
+            self._encode_btn.setStyleSheet(
+                "QPushButton { background-color: #c62828; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #d32f2f; }"
+                "QPushButton:disabled { background-color: #9e9e9e; color: #e0e0e0; }"
+            )
+        elif state == "cancel_split":
+            self._encode_btn.setText("Cancel Split")
+            self._encode_btn.setStyleSheet(
+                "QPushButton { background-color: #e65100; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #ef6c00; }"
+                "QPushButton:disabled { background-color: #9e9e9e; color: #e0e0e0; }"
+            )
+        else:  # cancelling
+            self._encode_btn.setText("Cancelling\u2026")
+            self._encode_btn.setStyleSheet(
+                "QPushButton { background-color: #9e9e9e; color: #e0e0e0; font-weight: bold; }"
+            )
+
+    def _on_encode_clicked(self) -> None:
+        if self._is_preview_running():
+            self._stop_preview(update_status=False)
+
+        # Handle cancellation of an in-progress M4B split
+        if self._is_split_running():
+            self._cancel_split_operation()
+            self._encode_btn.setEnabled(False)
+            self._encode_btn.setText("Cancelling\u2026")
+            self._status.showMessage("Cancelling split…")
+            return
+
+        if self._encode_thread is not None and self._encode_thread.isRunning():
+            if self._encode_worker is not None:
+                self._encode_worker.request_cancel()
+            self._encode_btn.setEnabled(False)
+            self._encode_btn.setText("Cancelling…")
+            self._status.showMessage("Cancellation requested…")
+            return
+
+        # Check if we have data to encode: either traditional WAV or individual files
+        if self._wav_path is None and not self._source_files:
+            self._status.showMessage("Load a WAV file or add WAV files first.")
+            return
+        
+        if not self._chapters:
+            self._status.showMessage("No chapters loaded.")
+            return
+
+        source_signature = self._current_intermediate_signature()
+        reuse_intermediate_wav: Path | None = None
+        chapters_for_worker = list(self._chapters)
+        if self._has_cached_intermediate():
+            if self._cached_intermediate_signature == source_signature:
+                reuse_intermediate_wav = self._cached_intermediate_wav
+                if self._cached_intermediate_encode_chapters:
+                    chapters_for_worker = list(self._cached_intermediate_encode_chapters)
+            else:
+                prompt = QMessageBox(self)
+                prompt.setWindowTitle("Chapter List Changed")
+                prompt.setIcon(QMessageBox.Icon.Question)
+                prompt.setText(
+                    "A saved intermediate WAV exists, but chapter rows were modified since it was created.\n\n"
+                    "A new intermediate WAV must be generated before encoding."
+                )
+                regenerate_btn = prompt.addButton(
+                    "Delete Old WAV and Generate New WAV",
+                    QMessageBox.ButtonRole.AcceptRole,
+                )
+                bail_btn = prompt.addButton(
+                    "Bail Out (Keep Modified List and WAV)",
+                    QMessageBox.ButtonRole.RejectRole,
+                )
+                restore_btn = prompt.addButton(
+                    "Cancel Encode and Restore List Matching Saved WAV",
+                    QMessageBox.ButtonRole.ActionRole,
+                )
+                prompt.setDefaultButton(cast(QPushButton, bail_btn))
+                prompt.exec()
+
+                clicked = prompt.clickedButton()
+                if clicked is regenerate_btn:
+                    self._clear_cached_intermediate(delete_file=True)
+                    chapters_for_worker = list(self._chapters)
+                elif clicked is restore_btn:
+                    if self._cached_intermediate_source_chapters:
+                        self._chapters = list(self._cached_intermediate_source_chapters)
+                        self._source_files = dict(self._cached_intermediate_source_files)
+                        self._row_cover_paths = dict(self._cached_intermediate_cover_paths)
+                        self._missing_cover_rows = set(self._cached_intermediate_missing_rows)
+                        self._is_individual_files_mode = bool(self._source_files)
+                        self._populate_table(self._chapters)
+                        self._update_cover_preview(None)
+                        if self._chapters:
+                            total_duration = self._chapters[-1].end_ms / 1000.0
+                            self._duration_edit.setText(_format_duration_label(total_duration))
+                    self._status.showMessage(
+                        "Encode cancelled. Chapter list restored to match saved intermediate WAV."
+                    )
+                    return
+                else:
+                    self._status.showMessage(
+                        "Encode cancelled. Modified chapter list and saved intermediate WAV were kept."
+                    )
+                    return
+
+        output_text = self._output_path_edit.text().strip()
+        if not output_text:
+            self._status.showMessage("Output file path is empty.")
+            return
+
+        output_path = Path(output_text)
+        if output_path.suffix.lower() != ".mp3":
+            output_path = output_path.with_suffix(".mp3")
+            self._set_output_path(output_path)
+
+        unpopulated_rows = self._get_unpopulated_artwork_rows()
+        if unpopulated_rows:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Missing Artwork")
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+            msg_box.setText(
+                f"Artwork is not populated for {len(unpopulated_rows)} chapter(s).\n\n"
+                "How would you like to proceed?"
+            )
+            parse_btn = msg_box.addButton(
+                "Parse Artwork Then Encode",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            encode_anyway_btn = msg_box.addButton(
+                "Encode Anyway (No Artwork Handling)",
+                QMessageBox.ButtonRole.ActionRole,
+            )
+            msg_box.addButton("Cancel Encode", QMessageBox.ButtonRole.RejectRole)
+            msg_box.setDefaultButton(parse_btn)
+            msg_box.exec()
+
+            clicked = msg_box.clickedButton()
+            if clicked is parse_btn:
+                self._on_process_covers()
+                remaining = self._get_unpopulated_artwork_rows()
+                if remaining:
+                    self._status.showMessage(
+                        f"Encode cancelled: artwork still missing for {len(remaining)} chapter(s)."
+                    )
+                    return
+            elif clicked is encode_anyway_btn:
+                pass
+            else:
+                self._status.showMessage("Encode cancelled.")
+                return
+
+        resolved_output_path = self._resolve_output_conflict(
+            output_path,
+            cancel_returns_none=True,
+            use_remembered_choice=True,
+        )
+        if resolved_output_path is None:
+            self._status.showMessage("Encode cancelled.")
+            return
+        output_path = resolved_output_path
+        self._set_output_path(output_path)
+
+        channels = self._channels
+        vbr_quality = self._vbr_quality
+        cbr_bitrate = None if self._use_vbr else f"{self._cbr_bitrate_kbps}k"
+
+        # Preserve cover selections that were already resolved in the GUI table.
+        cover_map_override: dict[str, Path] = {}
+        for row, chapter in enumerate(self._chapters):
+            book_title = _book_title_from_chapter(chapter.title)
+            cover_path = self._row_cover_paths.get(row)
+            if book_title and cover_path is not None:
+                cover_map_override.setdefault(book_title, cover_path)
+
+        self._set_controls_enabled(False)
+        self._encode_btn.setEnabled(True)
+        self._set_encode_btn_state("cancel")
+        self._encode_progress.setValue(0)
+        self._encode_progress_timeline = self._build_encode_progress_timeline(chapters_for_worker)
+        self._status.showMessage("Starting encode…")
+
+        self._encode_thread = QThread(self)
+        self._encode_worker = EncodeWorker(
+            input_wav=(
+                self._wav_path
+                if self._wav_path is not None
+                else next(iter(self._source_files.values()))
+            ),
+            output_mp3=output_path,
+            chapters=list(chapters_for_worker),
+            channels=channels,
+            vbr_quality=vbr_quality,
+            cbr_bitrate=cbr_bitrate,
+            source_files=dict(self._source_files) if self._source_files else None,
+            cover_map_override=cover_map_override,
+            reuse_intermediate_wav=reuse_intermediate_wav,
+        )
+        self._encode_worker.moveToThread(self._encode_thread)
+        self._encode_thread.started.connect(self._encode_worker.run)
+        self._encode_worker.progress.connect(self._on_encode_progress)
+        self._encode_worker.finished.connect(self._on_encode_finished)
+        self._encode_worker.failed.connect(self._on_encode_failed)
+        self._encode_worker.finished.connect(self._encode_thread.quit)
+        self._encode_worker.failed.connect(self._encode_thread.quit)
+        self._encode_thread.finished.connect(self._on_encode_thread_finished)
+        self._encode_thread.start()
+
+    def _on_encode_progress(self, percent: int, message: str, out_time_sec: float) -> None:
+        self._encode_progress.setValue(percent)
+        self._status.showMessage(message)
+        self._update_table_encode_progress(out_time_sec)
+
+    def _on_encode_finished(self, message: str, actual_bytes: int, payload: object) -> None:
+        self._encode_progress.setValue(100)
+        self._status.showMessage(message)
+        self._clear_table_encode_progress(reset_timeline=True)
+
+        intermediate_path: Path | None = None
+        chapters_for_encode: list[Chapter] = list(self._chapters)
+        if isinstance(payload, dict):
+            raw_intermediate = str(payload.get("intermediate_wav", "")).strip()
+            if raw_intermediate:
+                intermediate_path = Path(raw_intermediate)
+            raw_chapters = payload.get("chapters_for_encode")
+            if isinstance(raw_chapters, list) and all(
+                isinstance(ch, Chapter) for ch in raw_chapters
+            ):
+                chapters_for_encode = list(raw_chapters)
+
+        if intermediate_path is not None and intermediate_path.exists():
+            prompt = QMessageBox(self)
+            prompt.setWindowTitle("Keep Intermediate WAV?")
+            prompt.setIcon(QMessageBox.Icon.Question)
+            prompt.setText(
+                "Encoding is complete.\n\n"
+                "Keep the generated intermediate WAV for potential re-encodes?"
+            )
+            prompt.setInformativeText(str(intermediate_path))
+            keep_btn = prompt.addButton(
+                "Keep Intermediate WAV",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            delete_btn = prompt.addButton(
+                "Delete Intermediate WAV",
+                QMessageBox.ButtonRole.DestructiveRole,
+            )
+            prompt.setDefaultButton(cast(QPushButton, keep_btn))
+            prompt.exec()
+
+            if prompt.clickedButton() is keep_btn:
+                if (
+                    self._cached_intermediate_wav is not None
+                    and self._cached_intermediate_wav != intermediate_path
+                ):
+                    self._clear_cached_intermediate(delete_file=True)
+                self._cache_intermediate_for_reuse(intermediate_path, chapters_for_encode)
+                self._status.showMessage(
+                    f"Encode complete. Saved intermediate WAV for reuse: {intermediate_path.name}"
+                )
+            else:
+                try:
+                    intermediate_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        limit_config = self._get_size_limit_value()
+        if limit_config is not None:
+            limit_value, unit = limit_config
+            actual_value = self._actual_size_in_unit(actual_bytes, unit)
+            if actual_value <= limit_value:
+                return
+            excess_value = actual_value - limit_value
+            QMessageBox.warning(
+                self,
+                "File Size Limit Exceeded",
+                f"The output file exceeds the configured size limit.\n\n"
+                f"File size:   {format_bytes(actual_bytes)}\n"
+                f"Size limit:  {limit_value} {unit}\n"
+                f"Exceeds by:  {excess_value} {unit}",
+            )
+
+    def _on_encode_failed(self, message: str) -> None:
+        self._encode_progress.setValue(0)
+        self._clear_table_encode_progress(reset_timeline=True)
+        if "cancelled" in message.casefold():
+            self._status.showMessage(message)
+            return
+        self._status.showMessage(f"Encode failed: {message}")
+        QMessageBox.critical(self, "Encode Failed", message)
+
+    def _on_encode_thread_finished(self) -> None:
+        self._set_controls_enabled(True)
+        self._set_encode_btn_state("encode")
+        self._encode_btn.setEnabled(self._wav_path is not None or bool(self._source_files))
+        if self._encode_thread is not None:
+            self._encode_thread.deleteLater()
+        if self._encode_worker is not None:
+            self._encode_worker.deleteLater()
+        self._encode_thread = None
+        self._encode_worker = None
+
+    def _populate_table(self, chapters: list[Chapter]) -> None:
+        self._is_populating_table = True
+        self._table.blockSignals(True)
+        self._table.setRowCount(0)
+        self._table.setRowCount(len(chapters))
+
+        for row, ch in enumerate(chapters):
+            self._table.setRowHeight(row, THUMB_SIZE + 4)
+
+            num = QTableWidgetItem(str(ch.index))
+            num.setFlags(num.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setItem(row, 0, num)
+
+            title_item = QTableWidgetItem(ch.title)
+            title_item.setFlags(title_item.flags() | Qt.ItemFlag.ItemIsEditable)
+            title_item.setData(CHAPTER_KEY_ROLE, _chapter_key(ch))
+            self._table.setItem(row, 1, title_item)
+
+            start = QTableWidgetItem(format_seconds_hms(ch.start_ms / 1000.0))
+            start.setFlags(start.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            start.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setItem(row, 2, start)
+
+            end = QTableWidgetItem(format_seconds_hms(ch.end_ms / 1000.0))
+            end.setFlags(end.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            end.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setItem(row, 3, end)
+
+            cover_lbl = QLabel()
+            cover_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setCellWidget(row, 4, cover_lbl)
+
+        self._table.blockSignals(False)
+        self._is_populating_table = False
+        self._update_preview_controls(self._selected_chapter_row())
+
+    def _selected_chapter_row(self) -> int | None:
+        selected_ranges = self._table.selectedRanges()
+        if not selected_ranges:
+            return None
+        row = selected_ranges[0].topRow()
+        if row < 0 or row >= len(self._chapters):
+            return None
+        return row
+
+    def _chapter_duration_sec(self, row: int) -> float:
+        if row < 0 or row >= len(self._chapters):
+            return 0.0
+        chapter = self._chapters[row]
+        return max(0.1, (chapter.end_ms - chapter.start_ms) / 1000.0)
+
+    def _update_preview_controls(self, selected_row: int | None) -> None:
+        if selected_row is None:
+            self._preview_btn.setText("Start Preview")
+            self._preview_btn.setEnabled(False)
+            self._preview_counter_label.setText(_format_counter_label(0.0, 0.0))
+            return
+
+        enabled = self._reset_btn.isEnabled()
+        self._preview_btn.setEnabled(enabled)
+
+        if self._is_preview_running() and self._preview_row == selected_row:
+            self._preview_btn.setText("Stop Preview")
+            return
+
+        self._preview_btn.setText("Start Preview")
+        self._preview_counter_label.setText(
+            _format_counter_label(0.0, self._chapter_duration_sec(selected_row))
+        )
+
+    def _is_preview_running(self) -> bool:
+        if self._preview_player is not None:
+            return (
+                self._preview_player.playbackState()
+                == QMediaPlayer.PlaybackState.PlayingState
+            )
+        return self._preview_process is not None and self._preview_process.poll() is None
+
+    def _preview_target_for_row(self, row: int) -> tuple[Path, float, float] | None:
+        if row < 0 or row >= len(self._chapters):
+            return None
+
+        chapter = self._chapters[row]
+        duration_sec = max(0.1, (chapter.end_ms - chapter.start_ms) / 1000.0)
+
+        source_file = self._source_files.get(row)
+        if source_file is not None:
+            return source_file, 0.0, duration_sec
+
+        if self._wav_path is None:
+            return None
+
+        return self._wav_path, chapter.start_ms / 1000.0, duration_sec
+
+    def _kill_preview_process(self) -> None:
+        process = self._preview_process
+        if process is None:
+            return
+        if process.poll() is not None:
+            return
+
+        if sys.platform == "win32":
+            pid = int(process.pid)
+            if pid > 0:
+                run_kwargs: dict[str, Any] = {
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                }
+                if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        check=False,
+                        **run_kwargs,
+                    )
+                    return
+                except OSError:
+                    pass
+
+        process.kill()
+
+    def _stop_preview(
+        self,
+        *,
+        update_status: bool,
+        reset_counter: bool = True,
+    ) -> None:
+        self._preview_timer.stop()
+        if self._preview_player is not None:
+            self._preview_player.stop()
+        self._kill_preview_process()
+        self._preview_process = None
+        self._preview_row = None
+        self._preview_started_monotonic = 0.0
+        self._preview_duration_sec = 0.0
+        self._preview_start_offset_ms = 0
+        self._preview_end_offset_ms = 0
+        self._preview_wait_start_deadline = 0.0
+        self._clear_table_preview_progress()
+
+        selected_row = self._selected_chapter_row()
+        self._update_preview_controls(selected_row)
+        if not reset_counter:
+            return
+
+        if selected_row is None:
+            self._preview_counter_label.setText(_format_counter_label(0.0, 0.0))
+        else:
+            self._preview_counter_label.setText(
+                _format_counter_label(0.0, self._chapter_duration_sec(selected_row))
+            )
+
+        if update_status:
+            self._status.showMessage("Preview stopped.")
+
+    def _on_preview_clicked(self) -> None:
+        selected_row = self._selected_chapter_row()
+        if selected_row is None:
+            self._status.showMessage("Select a chapter first.")
+            return
+
+        if self._is_preview_running() and self._preview_row == selected_row:
+            self._stop_preview(update_status=True)
+            return
+
+        if self._is_preview_running():
+            self._stop_preview(update_status=False)
+
+        self._start_preview_for_row(selected_row)
+
+    def _start_preview_for_row(self, selected_row: int) -> bool:
+        if selected_row < 0 or selected_row >= len(self._chapters):
+            return False
+
+        target = self._preview_target_for_row(selected_row)
+        if target is None:
+            self._status.showMessage("Preview source is not available.")
+            return False
+
+        input_file, start_sec, duration_sec = target
+
+        if self._preview_player is not None and self._preview_audio_output is not None:
+            selected_device = self._preview_device.strip()
+            target_device = QMediaDevices.defaultAudioOutput()
+            if selected_device:
+                matched = None
+                for device in QMediaDevices.audioOutputs():
+                    if device.description().strip() == selected_device:
+                        matched = device
+                        break
+                if matched is not None:
+                    target_device = matched
+                else:
+                    self._status.showMessage(
+                        f"Selected preview device unavailable. Using system default: {target_device.description()}"
+                    )
+            self._preview_audio_output.setDevice(target_device)
+
+            self._preview_process = None
+            self._preview_player.stop()
+            self._preview_player.setSource(QUrl.fromLocalFile(str(input_file)))
+            start_ms = int(max(0.0, start_sec) * 1000.0)
+            self._preview_player.setPosition(start_ms)
+            self._preview_player.play()
+
+            self._preview_start_offset_ms = start_ms
+            self._preview_end_offset_ms = start_ms + int(duration_sec * 1000.0)
+            self._preview_wait_start_deadline = time.monotonic() + 2.0
+        else:
+            ffplay_bin, err = _run_capturing_errors(ensure_executable, "ffplay")
+            if err:
+                self._status.showMessage(f"ffplay not found — {err}")
+                return
+            assert isinstance(ffplay_bin, str)
+
+            cmd = [
+                ffplay_bin,
+                "-nodisp",
+                "-autoexit",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{start_sec:.3f}",
+                "-t",
+                f"{duration_sec:.3f}",
+                "-i",
+                str(input_file),
+            ]
+            if self._preview_device:
+                self._status.showMessage(
+                    "Explicit preview device selection requires QtMultimedia playback. Falling back to system default."
                 )
 
-        self._audio_output.setDevice(target_device)
-        self._audio_output.setMuted(self._is_muted)
-        self._apply_active_volume()
+            popen_kwargs: dict[str, Any] = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-    def _normalize_device_key(self, value: str) -> str:
-        return value.strip().casefold()
+            try:
+                self._preview_process = subprocess.Popen(cmd, **popen_kwargs)
+            except OSError as exc:
+                self._preview_process = None
+                self._status.showMessage(f"Could not start preview — {exc}")
+                return False
 
-    def _can_use_preview_mode(self) -> bool:
-        return self._normalize_device_key(self._output_device) != self._normalize_device_key(
-            self._preview_output_device
-        )
+            self._preview_start_offset_ms = 0
+            self._preview_end_offset_ms = int(duration_sec * 1000.0)
+            self._preview_wait_start_deadline = 0.0
 
-    def _active_output_device(self) -> str:
-        if self._is_preview_mode and self._can_use_preview_mode():
-            return self._preview_output_device
-        return self._output_device
+        self._preview_row = selected_row
+        self._preview_started_monotonic = time.monotonic()
+        self._preview_duration_sec = duration_sec
+        self._update_table_preview_progress(selected_row, 0.0)
+        self._preview_btn.setText("Stop Preview")
+        self._preview_counter_label.setText(_format_counter_label(0.0, duration_sec))
+        self._preview_timer.start()
+        self._status.showMessage(f"Previewing chapter {selected_row + 1}…")
+        return True
 
-    def _refresh_mode_toggle_state(self, notify_if_disabled: bool) -> None:
-        can_use = self._can_use_preview_mode()
-        if not can_use and self._is_preview_mode:
-            self._is_preview_mode = False
-            self._mode_btn.blockSignals(True)
-            self._mode_btn.setChecked(False)
-            self._mode_btn.blockSignals(False)
+    def _advance_preview_to_next_row(self) -> bool:
+        current_row = self._preview_row
+        if current_row is None:
+            return False
+        next_row = current_row + 1
+        if next_row >= len(self._chapters):
+            return False
 
-        self._mode_btn.setEnabled(can_use)
-        if can_use:
-            self._mode_btn.setToolTip("Toggle between Live and Preview output devices")
-        else:
-            self._mode_btn.setToolTip(
-                "Preview/Live switch is disabled because Live and Preview devices are the same"
-            )
+        self._stop_preview(update_status=False, reset_counter=False)
+        self._table.selectRow(next_row)
+        return self._start_preview_for_row(next_row)
 
-        self._set_mode_button_visual()
-        self._refresh_volume_controls()
-
-        if notify_if_disabled and not can_use:
-            self._status.showMessage(
-                "Preview/Live switch disabled: set Preview device to a different output in Options."
-            )
-
-    def _set_mode_button_visual(self) -> None:
-        if self._is_preview_mode:
-            self._mode_btn.setText("Mode: Preview")
-            self._mode_btn.setStyleSheet(
-                "QPushButton { background-color: #1565c0; color: white; font-weight: bold; }"
-                "QPushButton:hover { background-color: #1976d2; }"
-            )
-            self._set_mode_live_breathing(False)
-        else:
-            self._mode_btn.setText("Mode: Live")
-            self._mode_btn.setStyleSheet(
-                "QPushButton { background-color: #b71c1c; color: white; font-weight: bold; }"
-                "QPushButton:hover { background-color: #c62828; }"
-            )
-            self._set_mode_live_breathing(self._mode_btn.isEnabled())
-
-    def _set_mode_live_breathing(self, enabled: bool) -> None:
-        if not enabled:
-            if self._mode_live_breath_anim is not None:
-                self._mode_live_breath_anim.stop()
-            if self._mode_live_breath_effect is not None:
-                try:
-                    self._mode_live_breath_effect.setOpacity(1.0)
-                except RuntimeError:
-                    pass
-            self._mode_btn.setGraphicsEffect(None)
-            # Qt may delete the installed effect when detached; reset cached refs.
-            self._mode_live_breath_anim = None
-            self._mode_live_breath_effect = None
+    def _on_preview_seek_requested(self, row: int, fraction: float) -> None:
+        if not self._is_preview_running() or self._preview_row is None:
+            return
+        if row != self._preview_row:
+            return
+        if self._preview_player is None:
+            return
+        if self._preview_end_offset_ms <= self._preview_start_offset_ms:
             return
 
-        if self._mode_live_breath_effect is None:
-            self._mode_live_breath_effect = QGraphicsOpacityEffect(self._mode_btn)
-        try:
-            self._mode_btn.setGraphicsEffect(self._mode_live_breath_effect)
-        except RuntimeError:
-            self._mode_live_breath_effect = QGraphicsOpacityEffect(self._mode_btn)
-            self._mode_btn.setGraphicsEffect(self._mode_live_breath_effect)
-            self._mode_live_breath_anim = None
+        target_ms = self._preview_start_offset_ms + int(
+            (self._preview_end_offset_ms - self._preview_start_offset_ms) * fraction
+        )
+        self._preview_player.setPosition(target_ms)
+        elapsed = (target_ms - self._preview_start_offset_ms) / 1000.0
+        elapsed = max(0.0, min(elapsed, self._preview_duration_sec))
+        progress = 0.0
+        if self._preview_duration_sec > 0:
+            progress = elapsed / self._preview_duration_sec
+        self._update_table_preview_progress(row, progress)
+        self._preview_counter_label.setText(
+            _format_counter_label(elapsed, self._preview_duration_sec)
+        )
 
-        if self._mode_live_breath_anim is None:
-            self._mode_live_breath_anim = QPropertyAnimation(
-                self._mode_live_breath_effect,
-                b"opacity",
+    def _on_preview_timer_tick(self) -> None:
+        if self._preview_player is not None and self._preview_row is not None:
+            pos_ms = max(0, int(self._preview_player.position()))
+            if pos_ms >= self._preview_end_offset_ms > self._preview_start_offset_ms:
+                duration = self._preview_duration_sec
+                self._update_table_preview_progress(self._preview_row, 1.0)
+                self._preview_counter_label.setText(_format_counter_label(duration, duration))
+                if self._advance_preview_to_next_row():
+                    return
+                self._stop_preview(update_status=False, reset_counter=False)
+                self._status.showMessage("Preview finished.")
+                return
+
+            if self._is_preview_running():
+                elapsed = max(0.0, (pos_ms - self._preview_start_offset_ms) / 1000.0)
+                elapsed = min(elapsed, self._preview_duration_sec)
+                progress = 0.0
+                if self._preview_duration_sec > 0:
+                    progress = elapsed / self._preview_duration_sec
+                self._update_table_preview_progress(self._preview_row, progress)
+                self._preview_counter_label.setText(
+                    _format_counter_label(elapsed, self._preview_duration_sec)
+                )
+                return
+
+            if time.monotonic() < self._preview_wait_start_deadline:
+                return
+
+            if pos_ms >= self._preview_end_offset_ms - 120:
+                duration = self._preview_duration_sec
+                self._update_table_preview_progress(self._preview_row, 1.0)
+                self._preview_counter_label.setText(_format_counter_label(duration, duration))
+                if self._advance_preview_to_next_row():
+                    return
+                self._stop_preview(update_status=False, reset_counter=False)
+                self._status.showMessage("Preview finished.")
+                return
+
+            self._stop_preview(update_status=False, reset_counter=False)
+            self._status.showMessage("Preview could not start. Check playback device selection.")
+            return
+
+        if not self._is_preview_running():
+            duration = self._preview_duration_sec
+            if self._preview_row is not None:
+                self._update_table_preview_progress(self._preview_row, 1.0)
+            self._preview_counter_label.setText(_format_counter_label(duration, duration))
+            if self._advance_preview_to_next_row():
+                return
+            self._stop_preview(update_status=False, reset_counter=False)
+            self._status.showMessage("Preview finished.")
+            return
+
+        elapsed = max(0.0, time.monotonic() - self._preview_started_monotonic)
+        elapsed = min(elapsed, self._preview_duration_sec)
+        if self._preview_row is not None and self._preview_duration_sec > 0:
+            self._update_table_preview_progress(
+                self._preview_row,
+                elapsed / self._preview_duration_sec,
+            )
+        self._preview_counter_label.setText(
+            _format_counter_label(elapsed, self._preview_duration_sec)
+        )
+
+    def _on_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._is_populating_table:
+            return
+        row = item.row()
+        col = item.column()
+        if col != 1:
+            return
+        if row < 0 or row >= len(self._chapters):
+            return
+
+        new_title = item.text().strip()
+        old_chapter = self._chapters[row]
+        if not new_title:
+            self._table.blockSignals(True)
+            item.setText(old_chapter.title)
+            self._table.blockSignals(False)
+            return
+        if new_title == old_chapter.title:
+            return
+
+        self._chapters[row] = replace(old_chapter, title=new_title)
+
+    def _on_table_row_move_requested(self, source_row: int, target_row: int) -> None:
+        if self._is_populating_table or not self._chapters:
+            return
+
+        self._stop_preview(update_status=False)
+
+        row_count = len(self._chapters)
+        if not (0 <= source_row < row_count):
+            return
+        if target_row < 0:
+            target_row = 0
+        if target_row > row_count:
+            target_row = row_count
+        if target_row == source_row or target_row == source_row + 1:
+            return
+
+        old_chapters = list(self._chapters)
+        cover_by_key: dict[str, Path] = {}
+        missing_by_key: set[str] = set()
+        source_by_key: dict[str, Path] = {}  # Track source files
+        for old_row, old_ch in enumerate(old_chapters):
+            key = _chapter_key(old_ch)
+            if old_row in self._row_cover_paths:
+                cover_by_key[key] = self._row_cover_paths[old_row]
+            if old_row in self._missing_cover_rows:
+                missing_by_key.add(key)
+            if old_row in self._source_files:
+                source_by_key[key] = self._source_files[old_row]
+
+        moved = old_chapters.pop(source_row)
+        insert_row = target_row
+        if insert_row > source_row:
+            insert_row -= 1
+        old_chapters.insert(insert_row, moved)
+
+        new_chapters: list[Chapter] = []
+        new_cover_paths: dict[int, Path] = {}
+        new_missing_rows: set[int] = set()
+        new_source_files: dict[int, Path] = {}
+        for new_row, chapter in enumerate(old_chapters):
+            old_key = _chapter_key(chapter)
+            chapter = replace(chapter, index=new_row + 1)
+            new_chapters.append(chapter)
+            if old_key in cover_by_key:
+                new_cover_paths[new_row] = cover_by_key[old_key]
+            if old_key in missing_by_key:
+                new_missing_rows.add(new_row)
+            if old_key in source_by_key:
+                new_source_files[new_row] = source_by_key[old_key]
+
+        self._chapters = new_chapters
+        self._row_cover_paths = new_cover_paths
+        self._missing_cover_rows = new_missing_rows
+        self._source_files = new_source_files
+        self._populate_table(self._chapters)
+
+        for row, cover_path in self._row_cover_paths.items():
+            lbl = self._table.cellWidget(row, 4)
+            if not isinstance(lbl, QLabel):
+                continue
+            px = QPixmap(str(cover_path))
+            if px.isNull():
+                continue
+            lbl.setPixmap(
+                px.scaled(
+                    THUMB_SIZE,
+                    THUMB_SIZE,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+        self._table.selectRow(insert_row)
+        self._update_cover_preview(insert_row)
+
+    def _on_process_covers(self) -> None:
+        if not self._chapters:
+            return
+
+        target_rows: list[int]
+        mode_used = "all"
+
+        if self._next_cover_action == "missing" and self._missing_cover_rows:
+            target_rows = sorted(self._missing_cover_rows)
+            mode_used = "missing"
+        elif self._next_cover_action == "prompt_force_all":
+            reply = QMessageBox.question(
                 self,
+                "Force Update Covers",
+                "All chapters currently have artwork previews.\n"
+                "Force update all chapters?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
             )
-            self._mode_live_breath_anim.setDuration(1300)
-            self._mode_live_breath_anim.setStartValue(1.0)
-            self._mode_live_breath_anim.setKeyValueAt(0.5, 0.72)
-            self._mode_live_breath_anim.setEndValue(1.0)
-            self._mode_live_breath_anim.setLoopCount(-1)
-            self._mode_live_breath_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+            if reply == QMessageBox.StandardButton.No:
+                self._status.showMessage("No changes made.")
+                return
+            target_rows = list(range(len(self._chapters)))
+            mode_used = "all"
+        else:
+            target_rows = list(range(len(self._chapters)))
+            mode_used = "all"
 
-        self._mode_live_breath_anim.start()
+        self._status.showMessage("Resolving cover images…")
+        QApplication.processEvents()
 
-    def _on_mode_toggled(self, checked: bool) -> None:
-        if checked and not self._can_use_preview_mode():
-            self._mode_btn.blockSignals(True)
-            self._mode_btn.setChecked(False)
-            self._mode_btn.blockSignals(False)
-            self._is_preview_mode = False
-            self._set_mode_button_visual()
-            self._refresh_volume_controls()
-            return
+        # Check if we're processing individual files mode or traditional mode
+        is_individual_files = any(row in self._source_files for row in target_rows)
 
-        self._is_preview_mode = bool(checked)
-        self._set_mode_button_visual()
-        self._refresh_volume_controls()
-        self._apply_output_device()
+        loaded = 0
+        if mode_used == "all":
+            next_missing_rows: set[int] = set()
+        else:
+            next_missing_rows = set(self._missing_cover_rows)
 
-    def _on_browse_folder(self) -> None:
-        selected = QFileDialog.getExistingDirectory(
-            self,
-            "Choose Samples Folder",
-            str(self._samples_dir) if self._samples_dir else str(Path.home()),
-        )
-        if not selected:
-            return
+        for row in target_rows:
+            ch = self._chapters[row]
+            book_title = _book_title_from_chapter(ch.title)
+            lbl = self._table.cellWidget(row, 4)
+            if isinstance(lbl, QLabel):
+                lbl.clear()
+            self._row_cover_paths.pop(row, None)
 
-        path = Path(selected)
-        if not path.exists() or not path.is_dir():
-            QMessageBox.warning(self, "Invalid Folder", "Please choose a valid folder.")
-            return
+            # Handle individual files mode vs traditional mode
+            if is_individual_files and row in self._source_files:
+                # Individual files mode: look for cover next to the source file
+                source_file = self._source_files[row]
+                cover_path = _find_cover_for_source_file(source_file, book_title)
+            else:
+                # Traditional mode: look for cover in the main directory
+                if not self._wav_path:
+                    next_missing_rows.add(row)
+                    continue
+                
+                if not book_title:
+                    next_missing_rows.add(row)
+                    continue
 
-        self._samples_dir = path
-        self._save_samples_dir()
-        self._rescan_library()
+                covers_by_title, err = _run_capturing_errors(
+                    _find_covers_by_title, self._wav_path.parent
+                )
+                if err:
+                    next_missing_rows.add(row)
+                    continue
+                assert covers_by_title is not None
+                cover_path = covers_by_title.get(book_title.casefold())
+
+            if not cover_path:
+                next_missing_rows.add(row)
+                continue
+
+            px = QPixmap(str(cover_path))
+            if px.isNull():
+                next_missing_rows.add(row)
+                continue
+            px = px.scaled(
+                THUMB_SIZE,
+                THUMB_SIZE,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            if isinstance(lbl, QLabel):
+                lbl.setPixmap(px)
+            self._row_cover_paths[row] = cover_path
+            next_missing_rows.discard(row)
+            loaded += 1
+
+        selected_ranges = self._table.selectedRanges()
+        if selected_ranges:
+            self._update_cover_preview(selected_ranges[0].topRow())
+        else:
+            self._update_cover_preview(None)
+
+        self._missing_cover_rows = next_missing_rows
+
+        if self._missing_cover_rows:
+            if mode_used == "missing":
+                self._next_cover_action = "prompt_force_all"
+            else:
+                self._next_cover_action = "missing"
+        else:
+            self._next_cover_action = "prompt_force_all"
+
+        noun = "chapter" if loaded == 1 else "chapters"
+        if self._missing_cover_rows:
+            missing_titles: set[str] = set()
+            for row in sorted(self._missing_cover_rows):
+                chapter_title = self._chapters[row].title
+                missing_titles.add(_book_title_from_chapter(chapter_title) or chapter_title)
+            ordered = sorted(missing_titles, key=str.casefold)
+            preview = ", ".join(ordered[:3])
+            extra = len(ordered) - 3
+            if extra > 0:
+                preview = f"{preview} (+{extra} more)"
+            self._status.showMessage(
+                f"Processed {len(target_rows)} rows; loaded {loaded} {noun}. "
+                f"One or more covers are missing: {preview}"
+            )
+        else:
+            self._status.showMessage(
+                f"Processed {len(target_rows)} rows; loaded {loaded} {noun}."
+            )
+
+
+def _make_no_window_run_command():
+    """Return a patched run_command that suppresses the console window on Windows.
+
+    On Windows, subprocess.run() called from a GUI app with no console will
+    briefly flash a cmd window and can deliver spurious SIGINT to the parent
+    process.  CREATE_NO_WINDOW prevents both problems.
+    """
+    import wav_markers_to_mp3 as _m
+
+    def _patched(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        kwargs: dict[str, Any] = dict(text=True, capture_output=True)
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        return cast(subprocess.CompletedProcess[str], subprocess.run(cmd, **kwargs))
+
+    _m.run_command = _patched  # type: ignore[assignment]
 
 
 def main() -> None:
     if sys.platform == "win32":
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("JingleAllTheDay.App")
+        _make_no_window_run_command()
+
     app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
+    app.setApplicationName("AudioBook Slicer")
     icon_path = _HERE / "icon.png"
-    if icon_path.exists():
+    if icon_path.exists() and icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
-    _apply_windows_taskbar_icon(window)
     window.show()
-    try:
-        exit_code = app.exec()
-    except KeyboardInterrupt:
-        # Gracefully handle Ctrl+C / debugger stop without noisy tracebacks.
-        exit_code = 130
-    sys.exit(exit_code)
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--split-worker":
+        # Frozen-build worker mode: the EXE re-invokes itself via QProcess to run
+        # the M4B splitter. Shift argv so split_m4b_chapters.parse_args() sees its
+        # own arguments (input, --output-dir, etc.) at the normal positions.
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        from split_m4b_chapters import main as _split_main  # noqa: E402
+        _split_main()
+    else:
+        main()
