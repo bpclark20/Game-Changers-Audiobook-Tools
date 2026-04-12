@@ -185,13 +185,6 @@ def ensure_executable(name_or_path: str) -> str:
 
 
 def run_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    if sys.platform == "win32":
-        return subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
     return subprocess.run(cmd, text=True, capture_output=True)
 
 
@@ -242,32 +235,18 @@ def run_ffmpeg_with_progress(
     progress_label: str | None = None,
     progress_callback: Callable[[float, str, float], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
-    on_process_started: Callable[[subprocess.Popen[str]], None] | None = None,
-    on_process_finished: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     progress_cmd = [*cmd]
     output_path = progress_cmd.pop()
     progress_cmd.extend(["-progress", "pipe:1", "-nostats", output_path])
 
-    if sys.platform == "win32":
-        process = subprocess.Popen(
-            progress_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-    else:
-        process = subprocess.Popen(
-            progress_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-    if on_process_started is not None:
-        on_process_started(process)
+    process = subprocess.Popen(
+        progress_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
 
     progress_data: dict[str, str] = {}
     stdout_lines: list[str] = []
@@ -281,8 +260,12 @@ def run_ffmpeg_with_progress(
             if cancel_requested is not None and cancel_requested():
                 cancelled = True
                 print("\nCancelling encode - stopping ffmpeg...", flush=True)
-                process.kill()
-                process.wait()
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
                 break
 
             line = raw_line.strip()
@@ -338,11 +321,12 @@ def run_ffmpeg_with_progress(
     except KeyboardInterrupt:
         cancelled = True
         print("\nCancelling encode — stopping ffmpeg...", flush=True)
-        process.kill()
-        process.wait()
-    finally:
-        if on_process_finished is not None:
-            on_process_finished()
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
     return_code = process.wait() if not cancelled else (process.returncode or 1)
     stderr_text = process.stderr.read() if process.stderr is not None else ""
@@ -966,8 +950,6 @@ def encode_output(
     progress_label: str | None = None,
     progress_callback: Callable[[float, str, float], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
-    on_process_started: Callable[[subprocess.Popen[str]], None] | None = None,
-    on_process_finished: Callable[[], None] | None = None,
     sample_rate: int | None = None,
 ) -> int:
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1008,8 +990,6 @@ def encode_output(
                 progress_label=progress_label,
                 progress_callback=progress_callback,
                 cancel_requested=cancel_requested,
-                on_process_started=on_process_started,
-                on_process_finished=on_process_finished,
             )
             if result.returncode != 0:
                 temp_output.unlink(missing_ok=True)
