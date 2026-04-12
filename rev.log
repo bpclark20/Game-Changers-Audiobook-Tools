@@ -1,0 +1,8 @@
+## v1.1.0.041226
+- Added installer.
+- By default application is installed to %LOCALAPPDATA%\Programs.
+- Uninstaller also included which prompts the user to do a complete uninstall or just the application, preserving user data.
+
+## v1.0.0.041126
+- First build with version numbers.
+- Added Help->About Dialog window

@@ -1,200 +1,166 @@
-# AudioBookSlicer: Split `.m4b` by chapter
+# JingleAllTheDay
 
-This utility splits a DRM-free `.m4b`/`.m4a` audiobook into one file per chapter using chapter metadata.
+Desktop jingle browser for quickly categorizing and finding samples in your GoXLR sample folder.
 
-It uses:
-- `ffprobe` to read chapter start/end times
-- `ffmpeg` to extract each chapter with `-c copy` (no audio re-transcode) by default
+## Features
 
-## AudioBook Slicer GUI
+- Scans a sample library folder recursively for common audio files.
+- Stores category tags per file.
+- Supports multiple category tags per jingle.
+- Fast search plus multi-category filters.
+- Bulk apply category tags to selected rows.
+- Play selected jingle directly from the app.
+- Select audio output device and persist between launches.
 
-A PyQt6 graphical interface for converting WAV files with Adobe Audition markers into chaptered MP3 files.
+## Default sample folder
 
-### GUI Features
+The app starts with:
 
-- **Load WAV files** with chapter markers (Adobe Audition cue point format)
-- **Edit chapter titles** in-place (double-click any title to edit)
-- **Reorder chapters** via drag/drop in the chapter list
-- **Preview chapter artwork** by selecting chapters in the list
-- **Live encode progress** with per-chapter progress bars
-- **Adjust encoding options**: VBR quality, CBR bitrate, mono/stereo, or dual mono
-- **Size limit warnings**: Specify file size limit with unit selection (bytes, KB, MB, GB)
-- **Persistent settings**: Last-opened directory remembered between sessions
-- **Reset controls**: Reset all chapters to original markers or reset the entire app to defaults
+`C:\Users\brian\Documents\GoXLR\Samples`
 
-### Running the GUI
+You can change the folder from the GUI, and that choice is remembered.
 
-The GUI requires PyQt6 to be installed in the project's virtual environment.
-
-**Activate the virtual environment and run:**
+## Install
 
 ```powershell
-& '.venv\Scripts\Activate.ps1'
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+## Run
+
+```powershell
 python gui.py
 ```
 
-**Or use the venv Python directly:**
+## Build EXE
+
+Use PyInstaller from the project virtual environment:
 
 ```powershell
-& '.venv\Scripts\python.exe' gui.py
+.\.venv\Scripts\Activate.ps1
+pip install pyinstaller
+pyinstaller .\JingleAllTheDay.spec
 ```
 
-**Create a shortcut (optional):**
+Build output is created in:
 
-Create `run_gui.ps1`:
-```powershell
-& '.venv\Scripts\Activate.ps1'
-python gui.py
-```
+`dist\JingleAllTheDay\`
 
-Then double-click `run_gui.ps1` to launch.
+Distribute the entire `dist\JingleAllTheDay` folder, not just the `.exe`, because the default build is a one-folder package.
 
-### GUI Workflow
-
-1. Click **Open WAV File** and select a WAV file with chapter markers
-2. Enter your **Book Title** (used for matching cover artwork files)
-3. Edit chapter titles by double-clicking them in the table
-4. (Optional) **Drag chapters** to reorder them—the output will be encoded in your custom order
-5. (Optional) Place cover images in the same folder as the WAV (e.g., `Book Title.jpg`, `Book Title.png`)
-6. Click **Process Covers** to associate artwork with chapters
-7. Choose encoding options (VBR/CBR, sample rate, mono/stereo)
-8. Set a **Size Limit** if desired (file size warning threshold)
-9. Click **Encode** and choose output location
-10. Watch live progress bars update as the MP3 is encoded with chapter boundaries
-
-## Prerequisites
-
-1. Python 3.9+
-2. FFmpeg (must include both `ffmpeg` and `ffprobe`)
-
-### Windows FFmpeg install options
-
-1. `winget install Gyan.FFmpeg`
-2. Or download a build from https://www.gyan.dev/ffmpeg/builds/ and add its `bin` folder to `PATH`
-
-Verify:
+Or use the helper script in this repo, which flattens output into `dist\`:
 
 ```powershell
-ffmpeg -version
-ffprobe -version
+.\build_exe.ps1
 ```
 
-## Usage
+That script places `JingleAllTheDay.exe` and `_internal\` directly under `dist\`.
+
+## Build Installer (Windows)
+
+This repo includes an Inno Setup script that builds a Windows installer with:
+
+- Install location in the current user's AppData area:
+	- `%LOCALAPPDATA%\Programs\JingleAllTheDay`
+- A registered uninstaller in Windows `Installed Apps`
+- Optional launch of the app at the end of setup
+- Existing-install detection with choices to:
+	- Re-install/upgrade
+	- Uninstall current version and stop setup
+	- Cancel
+- Uninstall prompt asking whether to also remove user data:
+	- `%APPDATA%\JingleAllTheDay\settings.ini`
+	- `%APPDATA%\JingleAllTheDay\jingle-library.json`
+
+### Prerequisite
+
+Install Inno Setup 6 (provides `ISCC.exe`).
+
+### Build steps
+
+1. Build the bundled app output:
 
 ```powershell
-python .\split_m4b_chapters.py "C:\path\to\book.m4b"
+.\build_exe.ps1
 ```
 
-Default behavior:
-- Creates folder `<input_stem>_chapters` next to input file
-- Writes files like `001 - Chapter Name.m4b`
-- Uses stream copy (`-c copy`) for no-transcode extraction
-
-### Common options
+2. Build the installer:
 
 ```powershell
-# Custom output folder
-python .\split_m4b_chapters.py "book.m4b" -o ".\out"
-
-# Show commands only (no file writes)
-python .\split_m4b_chapters.py "book.m4b" --dry-run
-
-# Retry failed chapters with AAC encoding
-python .\split_m4b_chapters.py "book.m4b" --fallback-reencode --aac-bitrate 96k
-
-# If ffmpeg/ffprobe are not on PATH
-python .\split_m4b_chapters.py "book.m4b" --ffmpeg "C:\ffmpeg\bin\ffmpeg.exe" --ffprobe "C:\ffmpeg\bin\ffprobe.exe"
+.\build_installer.ps1
 ```
 
-## Convert Marker WAV To Chaptered MP3
+The installer executable is written to:
 
-If you have a single combined WAV with Adobe Audition markers (RIFF cue markers),
-you can encode it to chaptered MP3 and carry chapters plus per-chapter artwork over.
-The script expects chapter titles in the format `Book Title - *` and matching
-cover images like `Book Title.jpg` or `Book Title.png` next to the WAV:
+`installer\JingleAllTheDay-Setup-<version>.exe`
+
+You can override version/source when needed:
 
 ```powershell
-python .\wav_markers_to_mp3.py "C:\path\to\combined.wav"
+.\build_installer.ps1 -AppVersion "1.0.0-custom" -SourceDir ".\dist"
 ```
 
-Default behavior:
-- Reads WAV cue markers/labels and creates MP3 chapter tags
-- Requires matching cover images before encoding starts
-- Downmixes to mono (spoken-word friendly)
-- Encodes as VBR MP3 with `-q:a 6`
-- Preserves the input sample rate
-- Writes `<input_stem>.mp3` next to input
-- Warns if final output exceeds the effective 1.5% headroom budget, and again if it exceeds `1.0 GB`
+## Runtime Dependencies
 
-Validation and inspection options:
+The packaged EXE does not require Python to be installed on the target system. PyInstaller bundles the Python runtime, PyQt6, and the Qt libraries used by the app.
 
-```powershell
-# Validate inputs and print VBR sizing notes, then continue converting
-python .\wav_markers_to_mp3.py "combined.wav" --estimate
+Things that can still matter on the target machine:
 
-# Validate inputs only (no conversion)
-python .\wav_markers_to_mp3.py "combined.wav" --estimate-only
+- A working Windows audio device and drivers.
+- Permission to read the user's jingle/sample folders.
+- The `%APPDATA%` location, where the tag database is stored.
+- `ffprobe` is optional. If it is not present, playback still works, but duration detection for some non-WAV formats may be less accurate.
 
-# Change VBR quality and max-size warning threshold
-python .\wav_markers_to_mp3.py "combined.wav" --vbr-quality 4 --max-size-gb 1.0
-
-# Print marker/chapter timing debug info before conversion
-python .\wav_markers_to_mp3.py "combined.wav" --debug-markers
-
-# Preserve stereo instead of default mono downmix
-python .\wav_markers_to_mp3.py "combined.wav" --stereo
-```
-
-You can also pass explicit FFmpeg paths if needed:
-
-```powershell
-python .\wav_markers_to_mp3.py "combined.wav" --ffmpeg "C:\ffmpeg\bin\ffmpeg.exe" --ffprobe "C:\ffmpeg\bin\ffprobe.exe"
-```
-
-## Strip Chapter Number Prefix From WAV Files
-
-If you have files named like `024 - Chapter 24.wav`, `024 - Chapter 24 - Part 1.wav`,
-`000 - Prologue.wav`, or `040 - Epilogue.wav`, you can remove the leading numeric
-prefix with:
-
-```powershell
-# Preview only
-.\strip_chapter_number_prefix.ps1
-
-# Rename files
-.\strip_chapter_number_prefix.ps1 -Apply
-
-# Target a specific folder
-.\strip_chapter_number_prefix.ps1 "C:\path\to\chapter\folder"
-.\strip_chapter_number_prefix.ps1 "C:\path\to\chapter\folder" -Apply
-
-# Include subfolders
-.\strip_chapter_number_prefix.ps1 "C:\path\to\library" -Recurse
-.\strip_chapter_number_prefix.ps1 "C:\path\to\library" -Recurse -Apply
-```
-
-## Prefix Book Title To Files
-
-If you want to prepend the book title to every filename in a folder, including
-sidecar files like `.pkf`, run:
-
-```powershell
-# Preview only, then enter the title when prompted
-.\prefix_book_title.ps1 "C:\path\to\chapter\folder"
-
-# Rename files, then enter the title when prompted
-.\prefix_book_title.ps1 "C:\path\to\chapter\folder" -Apply
-```
-
-Example:
-
-```text
-Chapter 1.wav -> Role Model - Chapter 1.wav
-Chapter 1.pkf -> Role Model - Chapter 1.pkf
-```
+The current build spec is stored in `JingleAllTheDay.spec`.
 
 ## Notes
 
-- Input must be DRM-free.
-- If your file has multiple audio streams, use `--audio-stream` to select one.
-- Some files may fail stream copy at certain boundaries depending on container/stream quirks; use `--fallback-reencode` if needed.
+- Metadata is saved to `%APPDATA%\JingleAllTheDay\jingle-library.json`.
+- Settings are saved to `%APPDATA%\JingleAllTheDay\settings.ini`.
+- In table edits and bulk fields, use comma or semicolon separated tags.
+	- Example categories: `Holiday, Radio, Comedy`
+- Category filtering supports multiple tags at once using comma-separated input.
+  - Filter mode `Match Any` shows rows with at least one tag match.
+  - Filter mode `Match All` shows rows containing every entered tag.
+	- Default mode is `Match All`.
+- Search scope dropdown supports:
+	- `Name + Path + Tag`
+	- `Name Only`
+	- `Tag Only`
+	- `Path Only`
+- Active filter tags are shown as clickable chips under the filter box.
+	- Click a chip to remove that tag from the active filter.
+	- Use `Clear All` to remove every active category filter tag at once.
+	- Chips are colorized per tag for quick visual scanning.
+- Bulk update supports three modes:
+	- Replace tags: overwrite tags on selected rows.
+	- Append tags: add tags while preserving existing ones.
+	- Remove tags: remove matching tags from selected rows.
+	- Default mode is `Append tags`.
+
+- Playback controls:
+  - `Play Selected` toggles to `Stop Selected` while a sample is playing.
+  - `Loop On/Off` controls continuous repeat until playback is stopped.
+	- `Mode: Live/Preview` switches playback between your Live and Preview output devices.
+	- When playback reaches the end naturally, status updates to `Playback finished`.
+
+- Audio devices:
+	- Configure both `Live Device` and `Preview Device` in `Tools > Options`.
+	- If both devices are set to the same output, Preview/Live switching is disabled until Preview is changed.
+
+- Tools menu:
+	- `Update Categories from Folder Titles` derives category tags from folder names under your selected Samples folder.
+	- Root-level jingles get no folder-derived tag.
+	- The Samples root folder name is never added as a tag.
+	- You can choose to preserve existing tags (merge, case-insensitive de-dup) or overwrite with derived folder tags.
+	- `Clear All Categories` removes all category tags from every loaded jingle (with confirmation).
+
+- Bulk section:
+	- `From Folders (Selected)` applies the same folder-title update logic to selected rows only.
+	- Uses the same preserve/overwrite prompt as the Tools command.
+
+- File menu:
+	- `Export Tag Database...` saves a JSON backup of your current tag database.
+	- `Import Tag Database...` restores tags from a JSON backup (with confirmation).
